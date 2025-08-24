@@ -49,7 +49,22 @@ def extract_bg_sample(json_obj, led_key="SC_Green"):
     Looks for entries under json_obj['scans'][i]['parameters']['scanType'].
     Accepts the LED array either as a list of numbers or a comma-separated string.
     """
-    scans = json_obj.get("scans", [])
+    # Find "scans" anywhere in the JSON (top-level or nested under "payload", etc.)
+    def _find_scans(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k == "scans" and isinstance(v, list):
+                    return v
+                found = _find_scans(v)
+                if found is not None:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = _find_scans(item)
+                if found is not None:
+                    return found
+        return None
+    scans = _find_scans(json_obj) or []
     bg_list, sm_list = [], []
     for node in scans:
         if not isinstance(node, dict):
