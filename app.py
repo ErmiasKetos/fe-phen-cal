@@ -212,24 +212,51 @@ with tabs[0]:
                 st.dataframe(grpB)
 
         # Fit using replicate means (optional)
-        def fit_channel(sub_df, grp_df):
-            if sub_df is None:
-                return None
-            if use_rep_means and grp_df is not None:
-                xs = grp_df["concentration_mgL"].values.tolist()
-                ys = grp_df["A_mean"].values.tolist()
-                blanks = grp_df[grp_df["concentration_mgL"] == 0]["A_mean"].values.tolist()
-            else:
-                xs = sub_df["concentration_mgL"].values.tolist()
-                ys = sub_df["A"].values.tolist()
-                blanks = sub_df[sub_df["concentration_mgL"] == 0]["A"].values.tolist()
-            weights = None
-            if use_weighting:
-                weights = [1.0/max(x,1.0) for x in xs]
-            m,b,R2 = fit_linear(xs, ys, weights=weights)
-            lod, loq, sd_blank = lod_loq(blanks, m)
-            return {"m": m, "b": b, "R2": R2, "LoD": lod, "LoQ": loq, "blank_sd_A": sd_blank,
-                    "n_points": len(xs), "levels": sorted(set(xs))}
+        
+def fit_channel(sub_df, grp_df):
+    """Fit channel with sanity checks. Returns None and a message on failure."""
+    import numpy as np
+    if sub_df is None:
+        return None
+    # Build x/y from replicate means or raw, plus blanks for LoD/LoQ
+    if use_rep_means and grp_df is not None and not grp_df.empty:
+        xs = grp_df["concentration_mgL"].astype(float).values.tolist()
+        ys = grp_df["A_mean"].astype(float).values.tolist()
+        blanks = grp_df[grp_df["concentration_mgL"] == 0]["A_mean"].astype(float).values.tolist()
+    else:
+        if sub_df is None or sub_df.empty:
+            return None
+        xs = sub_df["concentration_mgL"].astype(float).values.tolist()
+        ys = sub_df["A"].astype(float).values.tolist()
+        blanks = sub_df[sub_df["concentration_mgL"] == 0]["A"].astype(float).values.tolist()
+
+    # Drop NaNs/Infs and enforce numeric
+    xy = [(x,y) for x,y in zip(xs,ys) if np.isfinite(x) and np.isfinite(y)]
+    if len(xy) < 2:
+        st.warning("Need at least 2 valid data points to fit a line.")
+        return None
+    xs = [x for x,_ in xy]
+    ys = [y for _,y in xy]
+
+    # Require at least 2 unique concentration levels
+    if len(set([round(x,6) for x in xs])) < 2:
+        st.warning("All concentrations are the same. Add at least one more level to fit a line.")
+        return None
+
+    # Build weights
+    weights = None
+    if use_weighting:
+        weights = [1.0/max(x,1.0) for x in xs]
+
+    try:
+        m,b,R2 = fit_linear(xs, ys, weights=weights)
+    except Exception as e:
+        st.error(f"Could not fit model: {e}")
+        return None
+
+    lod, loq, sd_blank = lod_loq(blanks, m)
+    return {"m": m, "b": b, "R2": R2, "LoD": lod, "LoQ": loq, "blank_sd_A": sd_blank,
+            "n_points": len(xs), "levels": sorted(set(xs))}
 
         st.markdown("### Model Fits")
         resA = fit_channel(subA, grpA)
