@@ -1,35 +1,58 @@
-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import streamlit as st
 import json
 import math
 import statistics as stats
-from pathlib import Path
 from datetime import datetime
 import pandas as pd
 import numpy as np
+import io
+import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Fe Phenanthroline Calibration & Analysis", layout="wide")
+st.set_page_config(page_title="Fe Phenanthroline — Method Development & Analysis", layout="wide")
 
-# ----------------- Utilities -----------------
+# =========================
+# Utility functions
+# =========================
 
 def parse_values(raw):
+    """
+    Accepts either a list of numbers or a comma-separated string of numbers.
+    Returns list[float].
+    """
     if raw is None:
         return []
     if isinstance(raw, list):
-        return [float(x) for x in raw]
-    if isinstance(raw, str):
-        parts = [p.strip() for p in raw.split(",") if p.strip() != ""]
         try:
-            return [float(p) for p in parts]
-        except ValueError:
+            return [float(x) for x in raw]
+        except Exception:
+            vals = []
+            for item in raw:
+                try:
+                    vals.append(float(item.get("value", item.get("intensity"))))
+                except Exception:
+                    pass
+            return vals
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.startswith("[") and s.endswith("]"):
             try:
-                arr = json.loads(raw)
+                arr = json.loads(s)
                 return [float(x) for x in arr]
             except Exception:
-                return []
+                pass
+        parts = [p.strip() for p in s.split(",") if p.strip() != ""]
+        try:
+            return [float(p) for p in parts]
+        except Exception:
+            return []
     return []
 
 def robust_mean(values):
+    """
+    Median/MAD outlier filter (3*MAD). Returns (mean_of_kept, kept_values).
+    """
     vals = [float(v) for v in values if v is not None]
     if len(vals) == 0:
         return float("nan"), []
@@ -43,52 +66,78 @@ def robust_mean(values):
         kept = vals
     return sum(kept)/len(kept), kept
 
+def _find_scans(obj):
+    """
+    Recursively search the JSON object for a key named 'scans' that holds a list.
+    Returns the first such list found or None.
+    """
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "scans" and isinstance(v, list):
+                return v
+            found = _find_scans(v)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_scans(item)
+            if found is not None:
+                return found
+    return None
+
+def _get_channel_array(node, led_key):
+    """
+    Extract the array for the given LED from a scan node.
+    Accepts direct key, case-insensitive key, or nested under 'channels'/'Channels'/'data'.
+    """
+    if led_key in node:
+        return parse_values(node.get(led_key))
+    for k in list(node.keys()):
+        if isinstance(k, str) and k.lower() == led_key.lower():
+            return parse_values(node.get(k))
+    for key in ["channels", "Channels", "data", "Data"]:
+        if isinstance(node.get(key), dict):
+            m = node[key]
+            if led_key in m:
+                return parse_values(m[led_key])
+            for mk in m.keys():
+                if isinstance(mk, str) and mk.lower() == led_key.lower():
+                    return parse_values(m[mk])
+    return []
+
 def extract_bg_sample(json_obj, led_key="SC_Green"):
     """
     Find Background and Sample arrays for the chosen LED inside a single run JSON.
-    Looks for entries under json_obj['scans'][i]['parameters']['scanType'].
-    Accepts the LED array either as a list of numbers or a comma-separated string.
+    Looks for entries where scanType ~ 'Background' or 'Sample' (case-insensitive),
+    either in node['parameters']['scanType'] or node['scanType'].
     """
-    # Find "scans" anywhere in the JSON (top-level or nested under "payload", etc.)
-    def _find_scans(obj):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if k == "scans" and isinstance(v, list):
-                    return v
-                found = _find_scans(v)
-                if found is not None:
-                    return found
-        elif isinstance(obj, list):
-            for item in obj:
-                found = _find_scans(item)
-                if found is not None:
-                    return found
-        return None
     scans = _find_scans(json_obj) or []
     bg_list, sm_list = [], []
     for node in scans:
         if not isinstance(node, dict):
             continue
         params = node.get("parameters") or {}
-        stype = params.get("scanType") or node.get("scanType")
-        ch_vals = node.get(led_key)
-        if ch_vals is None:
-            # try case-insensitive key match
-            for k in node.keys():
-                if isinstance(k, str) and k.lower() == led_key.lower():
-                    ch_vals = node[k]
-                    break
-        vals = parse_values(ch_vals)
-        if not vals:
+        stype = params.get("scanType") or node.get("scanType") or ""
+        ch_vals = _get_channel_array(node, led_key)
+        if not ch_vals:
             continue
-        if isinstance(stype, str) and stype.lower().startswith("back"):
-            bg_list = vals
-        elif isinstance(stype, str) and stype.lower().startswith("sam"):
-            sm_list = vals
+        s_low = str(stype).lower()
+        if s_low.startswith("back"):
+            bg_list = ch_vals
+        elif s_low.startswith("sam"):
+            sm_list = ch_vals
     return bg_list, sm_list
 
 def compute_absorbance_from_json_bytes(file_bytes, led_key="SC_Green"):
-    obj = json.loads(file_bytes.decode("utf-8"))
+    """
+    Compute absorbance A from a single device JSON file:
+    A = log10(mean(Background) / mean(Sample))
+    using robust means (MAD filter).
+    """
+    try:
+        obj = json.loads(file_bytes.decode("utf-8"))
+    except Exception:
+        obj = json.loads(file_bytes)
     bg_vals, sm_vals = extract_bg_sample(obj, led_key=led_key)
     if not bg_vals or not sm_vals:
         raise ValueError("Could not find both Background and Sample arrays for the selected LED in the JSON.")
@@ -105,48 +154,89 @@ def compute_absorbance_from_json_bytes(file_bytes, led_key="SC_Green"):
     return A, diag
 
 def fit_linear(xs, ys, weights=None):
+    """
+    Weighted (or unweighted) linear regression. Returns (slope, intercept, R2).
+    """
     xs = np.asarray(xs, dtype=float)
     ys = np.asarray(ys, dtype=float)
     if weights is None:
-        w = np.ones_like(xs)
+        w = np.ones_like(xs, dtype=float)
     else:
         w = np.asarray(weights, dtype=float)
+        if w.shape != xs.shape:
+            w = np.ones_like(xs, dtype=float)
     W = np.sum(w)
-    xw = np.sum(w*xs)/W
-    yw = np.sum(w*ys)/W
-    num = np.sum(w*(xs - xw)*(ys - yw))
-    den = np.sum(w*(xs - xw)**2)
+    xw = np.sum(w * xs) / W
+    yw = np.sum(w * ys) / W
+    num = np.sum(w * (xs - xw) * (ys - yw))
+    den = np.sum(w * (xs - xw) ** 2)
     if den == 0:
         raise ValueError("Zero variance in x.")
-    m = num/den
-    b = yw - m*xw
-    ss_tot = np.sum(w*(ys - yw)**2)
-    ss_res = np.sum(w*(ys - (m*xs + b))**2)
-    R2 = 1.0 - (ss_res/ss_tot if ss_tot > 0 else 0.0)
+    m = num / den
+    b = yw - m * xw
+    ss_tot = np.sum(w * (ys - yw) ** 2)
+    ss_res = np.sum(w * (ys - (m * xs + b)) ** 2)
+    R2 = 1.0 - (ss_res / ss_tot if ss_tot > 0 else 0.0)
     return float(m), float(b), float(R2)
 
 def lod_loq(blank_As, slope):
+    """
+    Compute LoD and LoQ from blank SD and slope.
+    """
     if slope == 0 or not blank_As:
         return float("nan"), float("nan"), 0.0
     sd = float(np.std(blank_As, ddof=0))
-    return 3.3*sd/abs(slope), 10.0*sd/abs(slope), sd
+    return 3.3 * sd / abs(slope), 10.0 * sd / abs(slope), sd
 
 def predict_conc(A, slope, intercept):
-    return (A - intercept)/slope
+    return (A - intercept) / slope
 
-# ----------------- UI -----------------
+def make_plot(xs, ys, m, b, title, xlabel="Concentration (mg/L)", ylabel="Absorbance (A)"):
+    """
+    Create a simple scatter + fitted line plot, return PNG and PDF bytes.
+    """
+    # Single plot (no subplots), no custom colors per instructions
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.scatter(xs, ys)
+    x_min, x_max = min(xs), max(xs)
+    span = x_max - x_min
+    grid_x = np.linspace(x_min - 0.05*span, x_max + 0.05*span if span > 0 else x_max + 1, 100)
+    ax.plot(grid_x, m*grid_x + b)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    fig.tight_layout()
+
+    png_buf = io.BytesIO()
+    fig.savefig(png_buf, format="png", dpi=200, bbox_inches="tight")
+    png_buf.seek(0)
+
+    pdf_buf = io.BytesIO()
+    fig.savefig(pdf_buf, format="pdf", bbox_inches="tight")
+    pdf_buf.seek(0)
+
+    plt.close(fig)
+    return png_buf.getvalue(), pdf_buf.getvalue()
+
+# =========================
+# UI
+# =========================
 
 st.title("Fe Phenanthroline — Method Development & Analysis")
 
 with st.sidebar:
     st.header("Configuration")
     led_key = st.selectbox("LED channel", ["SC_Green","SC_Blue2","SC_Orange","SC_Red"], index=0)
-    use_weighting = st.checkbox("Weighted linear fit (1/max(C,1))", value=True)
+    weighting_scheme = st.selectbox(
+        "Weighting scheme",
+        ["None (OLS)", "1/max(C,1)", "Variance-weighted (1/SD^2)"],
+        index=2
+    )
     use_rep_means = st.checkbox("Fit using replicate means", value=True)
     expected_reps = st.number_input("Expected replicates per level", min_value=1, max_value=10, value=2, step=1)
     st.caption("Replicates are used to average A at each level and compute SD/RSD.")
 
-tabs = st.tabs(["Calibration Builder","Unknown Prediction","DOE Plan","JSON Explorer","About"])
+tabs = st.tabs(["Calibration Builder", "Unknown Prediction", "DOE Plan", "JSON Explorer", "About"])
 
 # ---------- Calibration Builder ----------
 with tabs[0]:
@@ -154,14 +244,17 @@ with tabs[0]:
     st.write("Upload JSON files for **Fe²⁺** (no reducer) and **Total-Fe** (with reducer). Include several **0 mg/L blanks**.")
     uploaded_files = st.file_uploader("Drop multiple JSON files", type=["json"], accept_multiple_files=True)
 
-    # A per-file concentration & channel prompt
+    # Per-file concentration & channel prompt
+    file_rows = []
     if uploaded_files:
         st.markdown("### Assign channel & concentration to each file")
-        file_rows = []
         for f in uploaded_files:
             with st.expander(f"File: {f.name}", expanded=True):
-                ch = st.selectbox(f"Channel for {f.name}", ["Fe2","TotalFe"], key=f"ch_{f.name}")
-                conc = st.number_input(f"Concentration (mg/L) for {f.name}", min_value=0.0, max_value=1000.0, value=0.0, step=0.1, key=f"conc_{f.name}")
+                ch = st.selectbox(f"Channel for {f.name}", ["Fe2", "TotalFe"], key=f"ch_{f.name}")
+                conc = st.number_input(
+                    f"Concentration (mg/L) for {f.name}",
+                    min_value=0.0, max_value=1000.0, value=0.0, step=0.1, key=f"conc_{f.name}"
+                )
                 file_rows.append({"file_name": f.name, "channel": ch, "concentration_mgL": conc, "attach": f})
 
         if st.button("Compute absorbances"):
@@ -175,6 +268,7 @@ with tabs[0]:
             cal_results = pd.DataFrame(results)
             st.session_state["cal_results"] = cal_results
 
+    # Show absorbances and summaries
     if "cal_results" in st.session_state:
         cal_df = st.session_state["cal_results"]
         st.markdown("### Absorbances")
@@ -184,96 +278,133 @@ with tabs[0]:
         def aggregate(df_in, channel_name):
             sub = df_in[df_in["channel"].str.lower() == channel_name.lower()].copy()
             sub["concentration_mgL"] = pd.to_numeric(sub["concentration_mgL"], errors="coerce")
-            sub = sub.dropna(subset=["concentration_mgL","A"])
+            sub = sub.dropna(subset=["concentration_mgL", "A"])
             if sub.empty:
                 return None, None
             grp = sub.groupby("concentration_mgL", as_index=False).agg(
-                n=("A","count"),
-                A_mean=("A","mean"),
-                A_sd=("A","std")
+                n=("A", "count"),
+                A_mean=("A", "mean"),
+                A_sd=("A", "std")
             )
             grp["A_sd"].fillna(0.0, inplace=True)
-            grp["A_rsd_%"] = np.where(grp["A_mean"]!=0, grp["A_sd"]/grp["A_mean"]*100.0, np.nan)
+            grp["A_rsd_%"] = np.where(grp["A_mean"] != 0, grp["A_sd"] / grp["A_mean"] * 100.0, np.nan)
             grp["meets_n"] = grp["n"] >= expected_reps
             grp["flag"] = np.where(grp["meets_n"], "", f"Need ≥{expected_reps}")
             return sub, grp
 
         st.markdown("### Replicate summary by level")
-        cols = st.columns(2)
-        with cols[0]:
+        c1, c2 = st.columns(2)
+        with c1:
             st.markdown("**Fe²⁺**")
             subA, grpA = aggregate(cal_df, "Fe2")
             if grpA is not None:
                 st.dataframe(grpA)
-        with cols[1]:
+        with c2:
             st.markdown("**Total-Fe**")
             subB, grpB = aggregate(cal_df, "TotalFe")
             if grpB is not None:
                 st.dataframe(grpB)
 
-        # Fit using replicate means (optional)
-        
-def fit_channel(sub_df, grp_df):
-    """Fit channel with sanity checks. Returns None and a message on failure."""
-    import numpy as np
-    if sub_df is None:
-        return None
-    # Build x/y from replicate means or raw, plus blanks for LoD/LoQ
-    if use_rep_means and grp_df is not None and not grp_df.empty:
-        xs = grp_df["concentration_mgL"].astype(float).values.tolist()
-        ys = grp_df["A_mean"].astype(float).values.tolist()
-        blanks = grp_df[grp_df["concentration_mgL"] == 0]["A_mean"].astype(float).values.tolist()
-    else:
-        if sub_df is None or sub_df.empty:
-            return None
-        xs = sub_df["concentration_mgL"].astype(float).values.tolist()
-        ys = sub_df["A"].astype(float).values.tolist()
-        blanks = sub_df[sub_df["concentration_mgL"] == 0]["A"].astype(float).values.tolist()
+        # Fitting helper
+        def fit_channel(sub_df, grp_df, title):
+            """Fit channel with sanity checks. Returns fit results and plot bytes or None."""
+            if sub_df is None and grp_df is None:
+                return None, None, None
 
-    # Drop NaNs/Infs and enforce numeric
-    xy = [(x,y) for x,y in zip(xs,ys) if np.isfinite(x) and np.isfinite(y)]
-    if len(xy) < 2:
-        st.warning("Need at least 2 valid data points to fit a line.")
-        return None
-    xs = [x for x,_ in xy]
-    ys = [y for _,y in xy]
+            # Build x/y from replicate means or raw, plus blanks for LoD/LoQ
+            use_means = use_rep_means and (grp_df is not None) and (not grp_df.empty)
+            if use_means:
+                xs = grp_df["concentration_mgL"].astype(float).values.tolist()
+                ys = grp_df["A_mean"].astype(float).values.tolist()
+                sds = grp_df["A_sd"].astype(float).values.tolist()
+                blanks = grp_df[grp_df["concentration_mgL"] == 0]["A_mean"].astype(float).values.tolist()
+            else:
+                if sub_df is None or sub_df.empty:
+                    return None, None, None
+                xs = sub_df["concentration_mgL"].astype(float).values.tolist()
+                ys = sub_df["A"].astype(float).values.tolist()
+                sds = None  # not available at raw level
+                blanks = sub_df[sub_df["concentration_mgL"] == 0]["A"].astype(float).values.tolist()
 
-    # Require at least 2 unique concentration levels
-    if len(set([round(x,6) for x in xs])) < 2:
-        st.warning("All concentrations are the same. Add at least one more level to fit a line.")
-        return None
+            # Drop NaNs/Infs
+            xy = [(x, y, sds[i] if sds is not None and i < len(sds) else None) for i, (x, y) in enumerate(zip(xs, ys)) if np.isfinite(x) and np.isfinite(y)]
+            if len(xy) < 2:
+                st.warning(f"{title}: Need at least 2 valid data points to fit a line.")
+                return None, None, None
 
-    # Build weights
-    weights = None
-    if use_weighting:
-        weights = [1.0/max(x,1.0) for x in xs]
+            xs = [x for x, _, _ in xy]
+            ys = [y for _, y, _ in xy]
+            sds = [sd for _, _, sd in xy] if use_means else None
 
-    try:
-        m,b,R2 = fit_linear(xs, ys, weights=weights)
-    except Exception as e:
-        st.error(f"Could not fit model: {e}")
-        return None
+            # Require at least 2 unique levels
+            if len(set(round(x, 6) for x in xs)) < 2:
+                st.warning(f"{title}: All concentrations are the same. Add at least one more level.")
+                return None, None, None
 
-    lod, loq, sd_blank = lod_loq(blanks, m)
-    return {"m": m, "b": b, "R2": R2, "LoD": lod, "LoQ": loq, "blank_sd_A": sd_blank,
-            "n_points": len(xs), "levels": sorted(set(xs))}
+            # Build weights
+            weights = None
+            if weighting_scheme == "1/max(C,1)":
+                weights = [1.0 / max(x, 1.0) for x in xs]
+            elif weighting_scheme == "Variance-weighted (1/SD^2)" and use_means:
+                # Guard against zero SD (use small epsilon based on median nonzero sd or a tiny constant)
+                eps = 1e-6
+                nz = [sd for sd in sds if sd and sd > 0]
+                base = np.median(nz) if nz else 0.01
+                denom = [(sd if (sd and sd > 0) else base) ** 2 + eps for sd in sds]
+                weights = [1.0 / d for d in denom]
+            # else: OLS
+
+            try:
+                m, b, R2 = fit_linear(xs, ys, weights=weights)
+            except Exception as e:
+                st.error(f"{title}: Could not fit model: {e}")
+                return None, None, None
+
+            lod, loq, sd_blank = lod_loq(blanks, m)
+
+            # Build plot
+            try:
+                png_bytes, pdf_bytes = make_plot(xs, ys, m, b, title=title)
+            except Exception:
+                png_bytes, pdf_bytes = None, None
+
+            res = {
+                "m": m, "b": b, "R2": R2,
+                "LoD": lod, "LoQ": loq,
+                "blank_sd_A": sd_blank,
+                "n_points": len(xs),
+                "levels": sorted(set(xs)),
+                "weighting": weighting_scheme,
+                "used_replicate_means": use_means,
+            }
+            return res, png_bytes, pdf_bytes
 
         st.markdown("### Model Fits")
-        resA = fit_channel(subA, grpA)
-        resB = fit_channel(subB, grpB)
-        cols2 = st.columns(2)
-        with cols2[0]:
+        resA, pngA, pdfA = fit_channel(subA, grpA, "Fe²⁺ calibration")
+        resB, pngB, pdfB = fit_channel(subB, grpB, "Total-Fe calibration")
+        cc1, cc2 = st.columns(2)
+        with cc1:
             st.markdown("**Fe²⁺ model**")
-            if resA: st.json(resA, expanded=False)
-            else: st.info("Add Fe2 rows with valid A and concentrations.")
-        with cols2[1]:
+            if resA:
+                st.json(resA, expanded=False)
+                if pngA:
+                    st.download_button("Download Fe²⁺ plot (PNG)", data=pngA, file_name="Fe2_calibration.png", mime="image/png")
+                    st.download_button("Download Fe²⁺ plot (PDF)", data=pdfA, file_name="Fe2_calibration.pdf", mime="application/pdf")
+            else:
+                st.info("Add Fe²⁺ rows with valid A and concentrations (≥2 distinct levels).")
+        with cc2:
             st.markdown("**Total-Fe model**")
-            if resB: st.json(resB, expanded=False)
-            else: st.info("Add TotalFe rows with valid A and concentrations.")
+            if resB:
+                st.json(resB, expanded=False)
+                if pngB:
+                    st.download_button("Download Total-Fe plot (PNG)", data=pngB, file_name="TotalFe_calibration.png", mime="image/png")
+                    st.download_button("Download Total-Fe plot (PDF)", data=pdfB, file_name="TotalFe_calibration.pdf", mime="application/pdf")
+            else:
+                st.info("Add Total-Fe rows with valid A and concentrations (≥2 distinct levels).")
 
         if resA and resB:
             model = {
-                "created_at": datetime.utcnow().isoformat()+"Z",
+                "created_at": datetime.utcnow().isoformat() + "Z",
                 "led": led_key,
                 "slope": {"Fe2": resA["m"], "TotalFe": resB["m"]},
                 "intercept": {"Fe2": resA["b"], "TotalFe": resB["b"]},
@@ -282,13 +413,18 @@ def fit_channel(sub_df, grp_df):
                 "LoQ": {"Fe2": resA["LoQ"], "TotalFe": resB["LoQ"]},
                 "blank_sd_A": {"Fe2": resA["blank_sd_A"], "TotalFe": resB["blank_sd_A"]},
                 "range_mgL": [1.0, 25.0],
-                "use_weighting": use_weighting,
-                "use_replicate_means": True,
+                "weighting_scheme": weighting_scheme,
+                "use_replicate_means": resA["used_replicate_means"] and resB["used_replicate_means"],
                 "expected_reps_per_level": expected_reps,
+                "notes": "A = log10(mean(BG)/mean(Sample)); robust mean via MAD; replicate-aware; supports variance-weighted regression."
             }
             st.markdown("### Download model JSON")
-            st.download_button("Download fe_model.json", data=json.dumps(model, indent=2),
-                               file_name="fe_model.json", mime="application/json")
+            st.download_button(
+                "Download fe_model.json",
+                data=json.dumps(model, indent=2),
+                file_name="fe_model.json",
+                mime="application/json",
+            )
 
 # ---------- Unknown Prediction ----------
 with tabs[1]:
@@ -297,8 +433,11 @@ with tabs[1]:
     model_file = st.file_uploader("Model JSON", type=["json"], key="model_upload")
     run_files = st.file_uploader("Unknown run JSON(s)", type=["json"], accept_multiple_files=True, key="unknown_runs")
     if model_file and run_files:
-        model = json.loads(model_file.getvalue().decode("utf-8"))
-        led_m = model.get("led","SC_Green")
+        try:
+            model = json.loads(model_file.getvalue().decode("utf-8"))
+        except Exception:
+            model = json.loads(model_file.getvalue())
+        led_m = model.get("led", "SC_Green")
         A_vals = {}
         details = {}
         for f in run_files:
@@ -314,10 +453,10 @@ with tabs[1]:
         out = {}
         if "Fe2" in A_vals:
             m = model["slope"]["Fe2"]; b = model["intercept"]["Fe2"]
-            out["Fe2_mgL"] = (A_vals["Fe2"] - b)/m
+            out["Fe2_mgL"] = predict_conc(A_vals["Fe2"], m, b)
         if "TotalFe" in A_vals:
             m = model["slope"]["TotalFe"]; b = model["intercept"]["TotalFe"]
-            out["TotalFe_mgL"] = (A_vals["TotalFe"] - b)/m
+            out["TotalFe_mgL"] = predict_conc(A_vals["TotalFe"], m, b)
         if "Fe2_mgL" in out and "TotalFe_mgL" in out:
             out["Fe3_mgL"] = out["TotalFe_mgL"] - out["Fe2_mgL"]
         st.markdown("### Results")
@@ -327,24 +466,30 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("Generate a randomized DOE plan")
     st.write("Choose levels (mg/L) and replicates; download a CSV plan with randomized order for Fe²⁺ and Total-Fe.")
-    default_levels = [0,1,2,5,10,15,20,25]
+    default_levels = [0, 1, 2, 5, 10, 15, 20, 25]
     levels_str = st.text_input("Levels (comma-separated mg/L)", ",".join(map(str, default_levels)))
     reps = st.number_input("Replicates per level", min_value=1, max_value=5, value=2, step=1)
     if st.button("Build plan"):
         try:
-            levels = [float(x.strip()) for x in levels_str.split(",") if x.strip()!=""]
+            levels = [float(x.strip()) for x in levels_str.split(",") if x.strip() != ""]
         except Exception:
-            st.error("Could not parse levels.")
+            st.error("Could not parse levels. Using defaults.")
             levels = default_levels
         rows = []
-        for ch in ["Fe2","TotalFe"]:
+        for ch in ["Fe2", "TotalFe"]:
             pts = []
             for _ in range(int(reps)):
                 pts.extend(levels)
             import random
             random.shuffle(pts)
-            for i, c in enumerate(pts, start=1):
-                rows.append({"order": len(rows)+1, "channel": ch, "target_mgL": c, "json_path": "", "notes": ""})
+            for c in pts:
+                rows.append({
+                    "order": len(rows) + 1,
+                    "channel": ch,
+                    "target_mgL": c,
+                    "json_path": "",
+                    "notes": ""
+                })
         df = pd.DataFrame(rows)
         st.dataframe(df)
         st.download_button("Download DOE CSV", data=df.to_csv(index=False), file_name="doe_plan.csv", mime="text/csv")
@@ -359,7 +504,7 @@ with tabs[3]:
             A, diag = compute_absorbance_from_json_bytes(f.getvalue(), led_key=led_sel)
             st.success(f"Absorbance (A) at {led_sel}: {A:.6f}")
             st.json(diag, expanded=False)
-            st.table({k:[v] for k,v in diag.items()})
+            st.table({k: [v] for k, v in diag.items()})
         except Exception as e:
             st.error(str(e))
 
@@ -367,10 +512,11 @@ with tabs[3]:
 with tabs[4]:
     st.markdown("""
 **Fe Phenanthroline Calibration & Analysis**  
-- Parses device JSON with *Background* and *Sample* in the **same file**.  
+- Parses device JSON with *Background* and *Sample* in the **same file** (even if `scans` is nested under `payload`).  
 - Uses **SC_Green** (or selectable) channel; averages 10 readings with MAD outlier filtering.  
 - Absorbance: `A = log10(mean(BG) / mean(Sample))`.  
-- On upload, the app **asks for channel and concentration per file**, supports **replicates**, summarizes mean/SD/%RSD per level, and fits using replicate means (optional).  
-- Computes **LoD / LoQ** from blank SD; predicts unknowns; reports **Fe³⁺ by difference**.  
+- On upload, the app **asks for channel and concentration per file**, supports **replicates**, summarizes mean/SD/%RSD per level, and fits using replicate means.  
+- **Weighting options**: OLS, `1/max(C,1)`, and **variance-weighted (1/SD²)** when using replicate means.  
+- Exports **calibration plots** for Fe²⁺ and Total-Fe as **PNG** and **PDF**.
 """)
     st.caption("Tip: Include ≥4 blanks spread across the run to stabilize LoD/LoQ.")
