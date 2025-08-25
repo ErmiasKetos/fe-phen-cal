@@ -18,22 +18,23 @@ st.set_page_config(page_title="Fe Phenanthroline — Method Development & Analys
 
 def parse_values(raw):
     """
-    Accepts either a list of numbers or a comma-separated string of numbers.
-    Returns list[float].
+    Accepts either a list of numbers, a comma-separated string of numbers,
+    or a list of dicts with 'value'/'intensity'. Returns list[float].
     """
     if raw is None:
         return []
     if isinstance(raw, list):
-        try:
-            return [float(x) for x in raw]
-        except Exception:
-            vals = []
-            for item in raw:
-                try:
-                    vals.append(float(item.get("value", item.get("intensity"))))
-                except Exception:
-                    pass
-            return vals
+        out = []
+        for item in raw:
+            try:
+                out.append(float(item))
+            except Exception:
+                if isinstance(item, dict):
+                    if "value" in item:
+                        out.append(float(item["value"]))
+                    elif "intensity" in item:
+                        out.append(float(item["intensity"]))
+        return out
     if isinstance(raw, str):
         s = raw.strip()
         if s.startswith("[") and s.endswith("]"):
@@ -128,6 +129,57 @@ def extract_bg_sample(json_obj, led_key="SC_Green"):
             sm_list = ch_vals
     return bg_list, sm_list
 
+def extract_sample_node(json_obj):
+    """
+    Return the first node in scans that is a Sample.
+    """
+    scans = _find_scans(json_obj) or []
+    for node in scans:
+        if not isinstance(node, dict):
+            continue
+        params = node.get("parameters") or {}
+        stype = params.get("scanType") or node.get("scanType") or ""
+        if str(stype).lower().startswith("sam"):
+            return node
+    return None
+
+def get_loc_doses_from_sample(json_obj):
+    """
+    From the Sample scan node, extract LOC dosing volumes in µL.
+    Accepts keys like 'LOC1', 'LOC2', ... with numeric values.
+    Returns dict: {'LOC1': 200, 'LOC3': 2000, ...} for nonzero entries.
+    """
+    node = extract_sample_node(json_obj)
+    doses = {}
+    if node is None:
+        return doses
+    # Search in node and nested 'parameters' for LOC fields
+    candidates = [node, node.get("parameters", {})]
+    for src in candidates:
+        if isinstance(src, dict):
+            for k, v in src.items():
+                if isinstance(k, str) and k.upper().startswith("LOC"):
+                    try:
+                        val = float(v)
+                        if abs(val) > 0:
+                            doses[k] = val
+                    except Exception:
+                        continue
+    return doses
+
+def compute_spike_concentration_mgL(stock_mgL, spike_uL, base_sample_mL=40.0, extra_reagent_mL=0.0):
+    """
+    Compute final concentration after spiking:
+    C_final = C_stock * V_spike / V_total
+    where V_spike is in mL (spike_uL/1000), and V_total = base_sample_mL + extra_reagent_mL.
+    Caller can add total LOC volume to extra_reagent_mL if desired.
+    """
+    V_spike_mL = spike_uL / 1000.0
+    V_total_mL = base_sample_mL + extra_reagent_mL
+    if V_total_mL <= 0:
+        return float("nan")
+    return stock_mgL * (V_spike_mL / V_total_mL)
+
 def compute_absorbance_from_json_bytes(file_bytes, led_key="SC_Green"):
     """
     Compute absorbance A from a single device JSON file:
@@ -151,7 +203,7 @@ def compute_absorbance_from_json_bytes(file_bytes, led_key="SC_Green"):
         "bg_kept_n": len(bg_kept), "sm_kept_n": len(sm_kept),
         "bg_raw_n": len(bg_vals), "sm_raw_n": len(sm_vals),
     }
-    return A, diag
+    return A, diag, obj  # return parsed obj for LOC use
 
 def fit_linear(xs, ys, weights=None):
     """
@@ -195,7 +247,6 @@ def make_plot(xs, ys, m, b, title, xlabel="Concentration (mg/L)", ylabel="Absorb
     """
     Create a simple scatter + fitted line plot, return PNG and PDF bytes.
     """
-    # Single plot (no subplots), no custom colors per instructions
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.scatter(xs, ys)
     x_min, x_max = min(xs), max(xs)
@@ -244,35 +295,64 @@ with tabs[0]:
     st.write("Upload JSON files for **Fe²⁺** (no reducer) and **Total-Fe** (with reducer). Include several **0 mg/L blanks**.")
     uploaded_files = st.file_uploader("Drop multiple JSON files", type=["json"], accept_multiple_files=True)
 
-    # Per-file concentration & channel prompt
+    # Per-file concentration & channel prompt (with LOC-based inference)
     file_rows = []
     if uploaded_files:
         st.markdown("### Assign channel & concentration to each file")
         for f in uploaded_files:
             with st.expander(f"File: {f.name}", expanded=True):
-                ch = st.selectbox(f"Channel for {f.name}", ["Fe2", "TotalFe"], key=f"ch_{f.name}")
-                conc = st.number_input(
-                    f"Concentration (mg/L) for {f.name}",
-                    min_value=0.0, max_value=1000.0, value=0.0, step=0.1, key=f"conc_{f.name}"
-                )
-                file_rows.append({"file_name": f.name, "channel": ch, "concentration_mgL": conc, "attach": f})
-
-        if st.button("Compute absorbances"):
-            results = []
-            for row in file_rows:
+                # Parse JSON
                 try:
-                    A, diag = compute_absorbance_from_json_bytes(row["attach"].getvalue(), led_key=led_key)
-                    results.append({**row, "A": A, **diag})
+                    obj = json.loads(f.getvalue().decode("utf-8"))
+                except Exception:
+                    obj = json.loads(f.getvalue())
+
+                # Extract LOC doses from Sample node
+                loc_doses = get_loc_doses_from_sample(obj)
+                if loc_doses:
+                    st.write("Detected LOC doses (µL):", loc_doses)
+                    std_loc = st.selectbox(f"Which LOC is the STANDARD in {f.name}?", list(loc_doses.keys()), key=f"stdloc_{f.name}")
+                    stock_conc = st.number_input(f"Stock concentration (mg/L) at {std_loc}", min_value=0.0, max_value=1_000_000.0, value=1000.0, step=10.0, key=f"stock_{f.name}")
+                    base_vol = st.number_input("Base sample volume (mL)", min_value=1.0, max_value=200.0, value=40.0, step=0.5, key=f"base_{f.name}")
+                    extra_const = st.number_input("Extra constant reagent volume per run (mL)", min_value=0.0, max_value=20.0, value=0.0, step=0.1, key=f"extra_{f.name}")
+                    include_all_locs = st.checkbox("Include ALL LOC volumes in final volume (recommended)", value=True, key=f"inclall_{f.name}")
+                    total_loc_mL = sum(loc_doses.values())/1000.0 if include_all_locs else 0.0
+                    spike_uL = float(loc_doses.get(std_loc, 0.0))
+                    conc_calc = compute_spike_concentration_mgL(stock_conc, spike_uL, base_sample_mL=base_vol, extra_reagent_mL=extra_const + total_loc_mL)
+                    st.info(f"Calculated nominal concentration from {std_loc}: **{conc_calc:.4f} mg/L**")
+                    use_auto = st.checkbox("Use this calculated concentration", value=True, key=f"useauto_{f.name}")
+                else:
+                    st.warning("No LOC doses detected in the Sample scan. You can still enter concentration manually below.")
+                    conc_calc = 0.0
+                    use_auto = False
+
+                ch = st.selectbox(f"Channel for {f.name}", ["Fe2", "TotalFe"], key=f"ch_{f.name}")
+                manual_conc = st.number_input(
+                    f"Manual concentration (mg/L) for {f.name} (overrides if provided)",
+                    min_value=0.0, max_value=1000000.0, value=0.0, step=0.1, key=f"conc_{f.name}"
+                )
+                final_conc = manual_conc if manual_conc > 0 else (conc_calc if use_auto else 0.0)
+                st.caption(f"Final concentration used for this file: {final_conc:.4f} mg/L")
+
+                # Compute absorbance
+                try:
+                    A, diag, _ = compute_absorbance_from_json_bytes(f.getvalue(), led_key=led_key)
+                    st.code(f"A = {A:.6f} | BG mean = {diag['bg_avg']:.2f}, Sample mean = {diag['sm_avg']:.2f} | N(BG)={diag['bg_kept_n']}/{diag['bg_raw_n']}, N(S)={diag['sm_kept_n']}/{diag['sm_raw_n']}")
                 except Exception as e:
-                    results.append({**row, "A": None, "error": str(e)})
-            cal_results = pd.DataFrame(results)
+                    st.error(f"Absorbance calc failed: {e}")
+                    A = None
+
+                file_rows.append({"file_name": f.name, "channel": ch, "concentration_mgL": final_conc, "A": A})
+
+        if st.button("Add all to calibration table"):
+            cal_results = pd.DataFrame(file_rows)
             st.session_state["cal_results"] = cal_results
 
     # Show absorbances and summaries
     if "cal_results" in st.session_state:
         cal_df = st.session_state["cal_results"]
-        st.markdown("### Absorbances")
-        st.dataframe(cal_df.drop(columns=["attach"], errors="ignore"))
+        st.markdown("### Calibration table")
+        st.dataframe(cal_df)
 
         # Replicate aggregation
         def aggregate(df_in, channel_name):
@@ -346,7 +426,6 @@ with tabs[0]:
             if weighting_scheme == "1/max(C,1)":
                 weights = [1.0 / max(x, 1.0) for x in xs]
             elif weighting_scheme == "Variance-weighted (1/SD^2)" and use_means:
-                # Guard against zero SD (use small epsilon based on median nonzero sd or a tiny constant)
                 eps = 1e-6
                 nz = [sd for sd in sds if sd and sd > 0]
                 base = np.median(nz) if nz else 0.01
@@ -416,7 +495,7 @@ with tabs[0]:
                 "weighting_scheme": weighting_scheme,
                 "use_replicate_means": resA["used_replicate_means"] and resB["used_replicate_means"],
                 "expected_reps_per_level": expected_reps,
-                "notes": "A = log10(mean(BG)/mean(Sample)); robust mean via MAD; replicate-aware; supports variance-weighted regression."
+                "notes": "A = log10(mean(BG)/mean(Sample)); robust mean via MAD; replicate-aware; supports LOC-based concentration inference and variance-weighted regression."
             }
             st.markdown("### Download model JSON")
             st.download_button(
@@ -441,7 +520,7 @@ with tabs[1]:
         A_vals = {}
         details = {}
         for f in run_files:
-            A, diag = compute_absorbance_from_json_bytes(f.getvalue(), led_key=led_m)
+            A, diag, _ = compute_absorbance_from_json_bytes(f.getvalue(), led_key=led_m)
             details[f.name] = {"A": A, **diag}
             guess = "Fe2"
             nm = f.name.lower()
@@ -501,9 +580,13 @@ with tabs[3]:
     led_sel = st.selectbox("LED for this view", ["SC_Green","SC_Blue2","SC_Orange","SC_Red"], index=0, key="expl_led")
     if f:
         try:
-            A, diag = compute_absorbance_from_json_bytes(f.getvalue(), led_key=led_sel)
+            A, diag, obj = compute_absorbance_from_json_bytes(f.getvalue(), led_key=led_sel)
             st.success(f"Absorbance (A) at {led_sel}: {A:.6f}")
             st.json(diag, expanded=False)
+            # Show LOCs from this file, if any
+            locs = get_loc_doses_from_sample(obj)
+            if locs:
+                st.write("Detected LOC doses (µL):", locs)
             st.table({k: [v] for k, v in diag.items()})
         except Exception as e:
             st.error(str(e))
@@ -515,8 +598,7 @@ with tabs[4]:
 - Parses device JSON with *Background* and *Sample* in the **same file** (even if `scans` is nested under `payload`).  
 - Uses **SC_Green** (or selectable) channel; averages 10 readings with MAD outlier filtering.  
 - Absorbance: `A = log10(mean(BG) / mean(Sample))`.  
-- On upload, the app **asks for channel and concentration per file**, supports **replicates**, summarizes mean/SD/%RSD per level, and fits using replicate means.  
-- **Weighting options**: OLS, `1/max(C,1)`, and **variance-weighted (1/SD²)** when using replicate means.  
-- Exports **calibration plots** for Fe²⁺ and Total-Fe as **PNG** and **PDF**.
+- On upload, the app can **infer calibration concentrations from LOC doses** via \(M_1V_1=M_2V_2\); or you may enter values manually.  
+- Supports **replicate-aware** summaries, **variance-weighted (1/SD²)** or **1/max(C,1)** regression, and exports **PNG/PDF** calibration plots.  
 """)
     st.caption("Tip: Include ≥4 blanks spread across the run to stabilize LoD/LoQ.")
