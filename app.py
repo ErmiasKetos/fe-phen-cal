@@ -130,9 +130,7 @@ def extract_bg_sample(json_obj, led_key="SC_Green"):
     return bg_list, sm_list
 
 def extract_sample_node(json_obj):
-    """
-    Return the first node in scans that is a Sample.
-    """
+    """Return the first node in scans that is a Sample."""
     scans = _find_scans(json_obj) or []
     for node in scans:
         if not isinstance(node, dict):
@@ -206,9 +204,7 @@ def compute_absorbance_from_json_bytes(file_bytes, led_key="SC_Green"):
     return A, diag, obj  # return parsed obj for LOC use
 
 def fit_linear(xs, ys, weights=None):
-    """
-    Weighted (or unweighted) linear regression. Returns (slope, intercept, R2).
-    """
+    """Weighted (or unweighted) linear regression. Returns (slope, intercept, R2)."""
     xs = np.asarray(xs, dtype=float)
     ys = np.asarray(ys, dtype=float)
     if weights is None:
@@ -232,9 +228,7 @@ def fit_linear(xs, ys, weights=None):
     return float(m), float(b), float(R2)
 
 def lod_loq(blank_As, slope):
-    """
-    Compute LoD and LoQ from blank SD and slope.
-    """
+    """Compute LoD and LoQ from blank SD and slope."""
     if slope == 0 or not blank_As:
         return float("nan"), float("nan"), 0.0
     sd = float(np.std(blank_As, ddof=0))
@@ -244,9 +238,7 @@ def predict_conc(A, slope, intercept):
     return (A - intercept) / slope
 
 def make_plot(xs, ys, m, b, title, xlabel="Concentration (mg/L)", ylabel="Absorbance (A)"):
-    """
-    Create a simple scatter + fitted line plot, return PNG and PDF bytes.
-    """
+    """Create a simple scatter + fitted line plot, return PNG and PDF bytes."""
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.scatter(xs, ys)
     x_min, x_max = min(xs), max(xs)
@@ -270,6 +262,49 @@ def make_plot(xs, ys, m, b, title, xlabel="Concentration (mg/L)", ylabel="Absorb
     return png_buf.getvalue(), pdf_buf.getvalue()
 
 # =========================
+# LOC Profile (persistent mapping)
+# =========================
+
+DEFAULT_PROFILE = {
+    "defaults": {
+        "base_sample_mL": 40.0,
+        "extra_constant_mL": 0.0,
+        "include_all_loc_volumes": True
+    },
+    # "locs": {"LOC1": {"role":"standard","stock_mgL":1000.0,"notes":"Fe2 standard"}, ...}
+    "locs": {}
+}
+
+def get_profile():
+    if "loc_profile" not in st.session_state:
+        st.session_state["loc_profile"] = json.loads(json.dumps(DEFAULT_PROFILE))
+    return st.session_state["loc_profile"]
+
+def set_profile(p):
+    if "defaults" not in p:
+        p["defaults"] = DEFAULT_PROFILE["defaults"].copy()
+    if "locs" not in p:
+        p["locs"] = {}
+    st.session_state["loc_profile"] = p
+
+def profile_pick_standard(detected_locs: dict):
+    """
+    Given detected LOC doses from a file, use the profile to decide which LOC is standard.
+    Returns (std_loc, stock_mgL) or (None, None) if not determinable.
+    """
+    prof = get_profile()
+    loc_map = prof.get("locs", {})
+    candidates = [k for k in detected_locs.keys() if loc_map.get(k, {}).get("role") == "standard"]
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda k: float(detected_locs.get(k, 0.0)), reverse=True)
+    chosen = candidates[0]
+    stock = float(loc_map.get(chosen, {}).get("stock_mgL", 0.0) or 0.0)
+    if stock <= 0:
+        return chosen, None
+    return chosen, stock
+
+# =========================
 # UI
 # =========================
 
@@ -286,6 +321,60 @@ with st.sidebar:
     use_rep_means = st.checkbox("Fit using replicate means", value=True)
     expected_reps = st.number_input("Expected replicates per level", min_value=1, max_value=10, value=2, step=1)
     st.caption("Replicates are used to average A at each level and compute SD/RSD.")
+
+    with st.expander("LOC Profile (persistent)", expanded=False):
+        prof = get_profile()
+
+        # Defaults
+        st.markdown("**Defaults**")
+        prof["defaults"]["base_sample_mL"] = st.number_input(
+            "Base sample volume (mL) — default", min_value=1.0, max_value=500.0,
+            value=float(prof["defaults"].get("base_sample_mL", 40.0)), step=0.5
+        )
+        prof["defaults"]["extra_constant_mL"] = st.number_input(
+            "Extra constant reagent volume per run (mL) — default", min_value=0.0, max_value=50.0,
+            value=float(prof["defaults"].get("extra_constant_mL", 0.0)), step=0.1
+        )
+        prof["defaults"]["include_all_loc_volumes"] = st.checkbox(
+            "Include ALL LOC volumes in final volume by default",
+            value=bool(prof["defaults"].get("include_all_loc_volumes", True))
+        )
+
+        st.markdown("---")
+        st.markdown("**LOC mappings**")
+        for i in range(1, 17):
+            key = f"LOC{i}"
+            row = prof["locs"].get(key, {})
+            cols = st.columns([1, 1, 1, 2])
+            with cols[0]:
+                options = ["", "standard", "reducer", "buffer", "other"]
+                idx = options.index(row.get("role","")) if row.get("role","") in options else 0
+                role = st.selectbox(f"{key} role", options, index=idx, key=f"role_{key}")
+            with cols[1]:
+                stock = st.number_input(f"{key} stock (mg/L)", min_value=0.0, max_value=1_000_000.0,
+                                        value=float(row.get("stock_mgL", 0.0) or 0.0), step=10.0, key=f"stock_{key}")
+            with cols[2]:
+                note = st.text_input(f"{key} notes", value=row.get("notes",""), key=f"note_{key}")
+            if role or stock > 0 or note:
+                prof["locs"][key] = {"role": role or "", "stock_mgL": stock, "notes": note}
+            else:
+                if key in prof["locs"]:
+                    del prof["locs"][key]
+
+        st.markdown("---")
+        colp1, colp2 = st.columns(2)
+        with colp1:
+            st.download_button("Download profile JSON", data=json.dumps(prof, indent=2),
+                               file_name="loc_profile.json", mime="application/json")
+        with colp2:
+            up = st.file_uploader("Load profile JSON", type=["json"], key="loc_profile_upload")
+            if up:
+                try:
+                    p = json.loads(up.getvalue().decode("utf-8"))
+                    set_profile(p)
+                    st.success("Profile loaded.")
+                except Exception as e:
+                    st.error(f"Failed to load profile: {e}")
 
 tabs = st.tabs(["Calibration Builder", "Unknown Prediction", "DOE Plan", "JSON Explorer", "About"])
 
@@ -307,15 +396,46 @@ with tabs[0]:
                 except Exception:
                     obj = json.loads(f.getvalue())
 
-                # Extract LOC doses from Sample node
+                # Extract LOC doses and try profile auto-pick
                 loc_doses = get_loc_doses_from_sample(obj)
+                prof = get_profile()
+                auto_std_loc, auto_stock = profile_pick_standard(loc_doses) if loc_doses else (None, None)
+
                 if loc_doses:
                     st.write("Detected LOC doses (µL):", loc_doses)
-                    std_loc = st.selectbox(f"Which LOC is the STANDARD in {f.name}?", list(loc_doses.keys()), key=f"stdloc_{f.name}")
-                    stock_conc = st.number_input(f"Stock concentration (mg/L) at {std_loc}", min_value=0.0, max_value=1_000_000.0, value=1000.0, step=10.0, key=f"stock_{f.name}")
-                    base_vol = st.number_input("Base sample volume (mL)", min_value=1.0, max_value=200.0, value=40.0, step=0.5, key=f"base_{f.name}")
-                    extra_const = st.number_input("Extra constant reagent volume per run (mL)", min_value=0.0, max_value=20.0, value=0.0, step=0.1, key=f"extra_{f.name}")
-                    include_all_locs = st.checkbox("Include ALL LOC volumes in final volume (recommended)", value=True, key=f"inclall_{f.name}")
+                    if auto_std_loc:
+                        st.success(f"Profile suggests standard at **{auto_std_loc}**")
+                    std_loc = st.selectbox(
+                        f"Which LOC is the STANDARD in {f.name}?",
+                        list(loc_doses.keys()),
+                        index=(list(loc_doses.keys()).index(auto_std_loc) if auto_std_loc in loc_doses else 0),
+                        key=f"stdloc_{f.name}"
+                    )
+                    # Stock concentration: prefill from profile if available
+                    default_stock = float(auto_stock) if (auto_std_loc and auto_std_loc == std_loc and auto_stock) else float(prof['locs'].get(std_loc,{}).get('stock_mgL',0.0) or 0.0)
+                    stock_conc = st.number_input(
+                        f"Stock concentration (mg/L) at {std_loc}",
+                        min_value=0.0, max_value=1_000_000.0, value=default_stock if default_stock>0 else 1000.0, step=10.0, key=f"stock_{f.name}"
+                    )
+
+                    # Volume defaults from profile
+                    base_vol = st.number_input(
+                        "Base sample volume (mL)",
+                        min_value=1.0, max_value=200.0,
+                        value=float(prof['defaults'].get('base_sample_mL', 40.0)),
+                        step=0.5, key=f"base_{f.name}"
+                    )
+                    extra_const = st.number_input(
+                        "Extra constant reagent volume per run (mL)",
+                        min_value=0.0, max_value=20.0,
+                        value=float(prof['defaults'].get('extra_constant_mL', 0.0)),
+                        step=0.1, key=f"extra_{f.name}"
+                    )
+                    include_all_locs = st.checkbox(
+                        "Include ALL LOC volumes in final volume (recommended)",
+                        value=bool(prof['defaults'].get('include_all_loc_volumes', True)),
+                        key=f"inclall_{f.name}"
+                    )
                     total_loc_mL = sum(loc_doses.values())/1000.0 if include_all_locs else 0.0
                     spike_uL = float(loc_doses.get(std_loc, 0.0))
                     conc_calc = compute_spike_concentration_mgL(stock_conc, spike_uL, base_sample_mL=base_vol, extra_reagent_mL=extra_const + total_loc_mL)
@@ -423,6 +543,8 @@ with tabs[0]:
 
             # Build weights
             weights = None
+            if st.session_state.get("weighting_scheme_cache", None) is None:
+                st.session_state["weighting_scheme_cache"] = "None"
             if weighting_scheme == "1/max(C,1)":
                 weights = [1.0 / max(x, 1.0) for x in xs]
             elif weighting_scheme == "Variance-weighted (1/SD^2)" and use_means:
@@ -583,7 +705,6 @@ with tabs[3]:
             A, diag, obj = compute_absorbance_from_json_bytes(f.getvalue(), led_key=led_sel)
             st.success(f"Absorbance (A) at {led_sel}: {A:.6f}")
             st.json(diag, expanded=False)
-            # Show LOCs from this file, if any
             locs = get_loc_doses_from_sample(obj)
             if locs:
                 st.write("Detected LOC doses (µL):", locs)
@@ -598,7 +719,7 @@ with tabs[4]:
 - Parses device JSON with *Background* and *Sample* in the **same file** (even if `scans` is nested under `payload`).  
 - Uses **SC_Green** (or selectable) channel; averages 10 readings with MAD outlier filtering.  
 - Absorbance: `A = log10(mean(BG) / mean(Sample))`.  
-- On upload, the app can **infer calibration concentrations from LOC doses** via \(M_1V_1=M_2V_2\); or you may enter values manually.  
+- Can **infer calibration concentrations from LOC doses** via \(M_1V_1=M_2V_2\) using a **LOC Profile** (persistent mapping of roles/stock) or manual entry.  
 - Supports **replicate-aware** summaries, **variance-weighted (1/SD²)** or **1/max(C,1)** regression, and exports **PNG/PDF** calibration plots.  
 """)
     st.caption("Tip: Include ≥4 blanks spread across the run to stabilize LoD/LoQ.")
