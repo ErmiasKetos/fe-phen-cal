@@ -403,19 +403,15 @@ with tabs[0]:
 
                 if loc_doses:
                     st.write("Detected LOC doses (µL):", loc_doses)
-                    if auto_std_loc:
+                    keys = list(loc_doses.keys())
+                    options = ["(no standard)"] + keys
+                    default_idx = 0
+                    if auto_std_loc in keys:
+                        default_idx = 1 + keys.index(auto_std_loc)
                         st.success(f"Profile suggests standard at **{auto_std_loc}**")
                     std_loc = st.selectbox(
                         f"Which LOC is the STANDARD in {f.name}?",
-                        list(loc_doses.keys()),
-                        index=(list(loc_doses.keys()).index(auto_std_loc) if auto_std_loc in loc_doses else 0),
-                        key=f"stdloc_{f.name}"
-                    )
-                    # Stock concentration: prefill from profile if available
-                    default_stock = float(auto_stock) if (auto_std_loc and auto_std_loc == std_loc and auto_stock) else float(prof['locs'].get(std_loc,{}).get('stock_mgL',0.0) or 0.0)
-                    stock_conc = st.number_input(
-                        f"Stock concentration (mg/L) at {std_loc}",
-                        min_value=0.0, max_value=1_000_000.0, value=default_stock if default_stock>0 else 1000.0, step=10.0, key=f"stock_{f.name}"
+                        options, index=default_idx, key=f"stdloc_{f.name}"
                     )
 
                     # Volume defaults from profile
@@ -437,14 +433,35 @@ with tabs[0]:
                         key=f"inclall_{f.name}"
                     )
                     total_loc_mL = sum(loc_doses.values())/1000.0 if include_all_locs else 0.0
-                    spike_uL = float(loc_doses.get(std_loc, 0.0))
-                    conc_calc = compute_spike_concentration_mgL(stock_conc, spike_uL, base_sample_mL=base_vol, extra_reagent_mL=extra_const + total_loc_mL)
-                    st.info(f"Calculated nominal concentration from {std_loc}: **{conc_calc:.4f} mg/L**")
+
+                    if std_loc == "(no standard)":
+                        conc_calc = 0.0
+                        st.info("No standard spike selected → assigned **0.0000 mg/L** (blank).")
+                    else:
+                        # Stock concentration: prefill from profile if available
+                        default_stock = None
+                        if auto_std_loc and auto_std_loc == std_loc and auto_stock:
+                            default_stock = float(auto_stock)
+                        elif prof['locs'].get(std_loc, {}).get('stock_mgL', 0.0):
+                            default_stock = float(prof['locs'][std_loc]['stock_mgL'])
+                        stock_conc = st.number_input(
+                            f"Stock concentration (mg/L) at {std_loc}",
+                            min_value=0.0, max_value=1_000_000.0, value=(default_stock if default_stock is not None else 1000.0),
+                            step=10.0, key=f"stock_{f.name}"
+                        )
+                        spike_uL = float(loc_doses.get(std_loc, 0.0))
+                        conc_calc = compute_spike_concentration_mgL(
+                            stock_conc, spike_uL,
+                            base_sample_mL=base_vol,
+                            extra_reagent_mL=extra_const + total_loc_mL
+                        )
+                        st.info(f"Calculated nominal concentration from {std_loc}: **{conc_calc:.4f} mg/L**")
+
                     use_auto = st.checkbox("Use this calculated concentration", value=True, key=f"useauto_{f.name}")
                 else:
-                    st.warning("No LOC doses detected in the Sample scan. You can still enter concentration manually below.")
+                    st.warning("No LOC doses detected in the Sample scan → assigned **0.0000 mg/L** (blank).")
                     conc_calc = 0.0
-                    use_auto = False
+                    use_auto = True  # 0 by default
 
                 ch = st.selectbox(f"Channel for {f.name}", ["Fe2", "TotalFe"], key=f"ch_{f.name}")
                 manual_conc = st.number_input(
@@ -543,8 +560,6 @@ with tabs[0]:
 
             # Build weights
             weights = None
-            if st.session_state.get("weighting_scheme_cache", None) is None:
-                st.session_state["weighting_scheme_cache"] = "None"
             if weighting_scheme == "1/max(C,1)":
                 weights = [1.0 / max(x, 1.0) for x in xs]
             elif weighting_scheme == "Variance-weighted (1/SD^2)" and use_means:
@@ -721,5 +736,6 @@ with tabs[4]:
 - Absorbance: `A = log10(mean(BG) / mean(Sample))`.  
 - Can **infer calibration concentrations from LOC doses** via \(M_1V_1=M_2V_2\) using a **LOC Profile** (persistent mapping of roles/stock) or manual entry.  
 - Supports **replicate-aware** summaries, **variance-weighted (1/SD²)** or **1/max(C,1)** regression, and exports **PNG/PDF** calibration plots.  
+- If **no standard spike** is detected or selected, the run is treated as a **0 mg/L blank** automatically.
 """)
     st.caption("Tip: Include ≥4 blanks spread across the run to stabilize LoD/LoQ.")
