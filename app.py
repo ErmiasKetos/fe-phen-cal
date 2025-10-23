@@ -1486,7 +1486,7 @@ def show_interference_results(analysis, config):
         fillcolor="green",
         opacity=0.1,
         line_width=0
-    ))
+    )
     
     fig.update_layout(
         title="Recovery by Interferent",
