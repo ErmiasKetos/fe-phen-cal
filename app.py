@@ -1450,6 +1450,86 @@ def show_design_tab(session_id, step_id, step_config):
             st.balloons()
             st.rerun()
 
+
+# ============================================================================
+# MAIN APPLICATION
+# ============================================================================
+
+def main():
+    """Main application entry point"""
+    
+    # Show welcome page if no active session
+    if st.session_state.show_welcome or not st.session_state.current_session:
+        show_welcome_page()
+        return
+    
+    # Get current session
+    session_id = st.session_state.current_session
+    session = st.session_state.sessions[session_id]
+    
+    # Display header
+    st.markdown(f'<div class="main-header">🔬 KETOS R&D Analytical Method Validation</div>', 
+                unsafe_allow_html=True)
+    
+    st.markdown(f"""
+    <div class="info-box">
+    <strong>Method:</strong> {session.method_name} &nbsp;|&nbsp; 
+    <strong>Analyte:</strong> {session.analyte_name} &nbsp;|&nbsp; 
+    <strong>Developer:</strong> {session.developer_name}
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Sidebar navigation
+    with st.sidebar:
+        show_session_info_sidebar()
+        
+        st.title("📋 Validation Steps")
+        
+        steps = st.session_state[f'validation_steps_{session_id}']
+        completed = sum(1 for s in steps.values() if s.status == 'analyzed')
+        total = len(steps)
+        
+        st.metric("Progress", f"{completed}/{total}")
+        st.progress(completed / total if total > 0 else 0)
+        
+        st.markdown("---")
+        
+        # Step navigation buttons
+        for step_id, step_config in steps.items():
+            status_emoji = {
+                'not_started': '⚪',
+                'designed': '🔵',
+                'collecting': '🔄',
+                'completed': '✅',
+                'analyzed': '🎉'
+            }
+            
+            emoji = status_emoji.get(step_config.status, '⚪')
+            
+            if st.button(f"{emoji} {step_config.step_name}", key=f"nav_{step_id}", use_container_width=True):
+                st.session_state[f'current_step_{session_id}'] = step_id
+                st.rerun()
+        
+        st.markdown("---")
+        
+        if st.button("🔧 LOC Configuration", use_container_width=True):
+            st.session_state[f'current_step_{session_id}'] = 'config'
+            st.rerun()
+        
+        if st.button("📊 Dashboard", use_container_width=True):
+            st.session_state[f'current_step_{session_id}'] = 'dashboard'
+            st.rerun()
+    
+    # Main content area
+    current_step = st.session_state.get(f'current_step_{session_id}', 'linearity')
+    
+    if current_step == 'config':
+        show_config(session_id)
+    elif current_step == 'dashboard':
+        show_dashboard(session_id)
+    else:
+        show_validation_step(session_id, current_step)
+
 # ============================================================================
 # COLLECT TAB - Session-aware data collection
 # ============================================================================
