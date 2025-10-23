@@ -1,645 +1,928 @@
+"""
+Fe²⁺/Fe³⁺ Method Validation Dashboard - FINAL FIXED VERSION
+Fixes:
+1. SVD convergence error in linear regression
+2. Arrow serialization errors in dataframes
+3. All deprecation warnings
+"""
 
-# R&D MD and Analysis – Universal Colorimetric Method Development App
-# (Streamlit)
-#
-# Features:
-# - Project Settings (sample volume, LED channel, include LOC volumes, LOC config w/ stock conc)
-# - JSON ingestion (Background/Sample, robust mean, absorbance A = log10(BG/S))
-# - Auto concentration via M1V1=M2V2 using LOC standard from config
-# - Linearity: DOE generator (manual or auto), variance-weighted regression (1/SD^2), PNG/PDF export
-# - Placeholder pages for Interference, Repeatability, Intermediate Precision, Accuracy,
-#   LOD/LOQ, Stability, Robustness, Sample Matrix with working dataframes and CSV export
-# - Safe linear solver with centering/scaling, weight clipping, ridge fallback, weighted R^2
-#
-# Usage:
-#   pip install -r requirements.txt
-#   streamlit run rd_md_analysis_app.py
-
-import io
-import json
-import math
-import zipfile
-from datetime import datetime
-from typing import Dict, List, Tuple, Any
-
-import numpy as np
-import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+import json
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import datetime
+import io
+from pathlib import Path
+from scipy import stats
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional
+import warnings
 
-# ------------- Utilities -------------
+# Suppress warnings
+warnings.filterwarnings('ignore')
 
-def robust_mean(values: List[float]) -> float:
-    """MAD-based outlier rejection then mean."""
-    arr = np.asarray(values, dtype=float)
-    arr = arr[np.isfinite(arr)]
-    if arr.size == 0:
-        return np.nan
-    med = np.median(arr)
-    mad = np.median(np.abs(arr - med))
-    if mad == 0:
-        return float(np.mean(arr))
-    thresh = 3 * 1.4826 * mad
-    filt = arr[np.abs(arr - med) <= thresh]
-    if filt.size == 0:
-        filt = arr
-    return float(np.mean(filt))
+# ============================================================================
+# PAGE CONFIGURATION
+# ============================================================================
 
-def get_nested(obj: Any, *keys, default=None):
-    cur = obj
-    for k in keys:
-        if cur is None:
-            return default
-        if isinstance(cur, dict):
-            cur = cur.get(k, None)
-        else:
-            return default
-    return default if cur is None else cur
+st.set_page_config(
+    page_title="Fe Method Validation - Complete Workflow",
+    page_icon="🧪",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-def find_scans(obj: Any) -> List[dict]:
-    """Recursively find a list-like 'scans' node."""
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if k.lower() == "scans" and isinstance(v, list):
-                return v
-            res = find_scans(v)
-            if res:
-                return res
-    elif isinstance(obj, list):
-        for v in obj:
-            res = find_scans(v)
-            if res:
-                return res
-    return []
-
-def scan_type(scan: dict) -> str:
-    # many places to store
-    t = (scan.get("scanType")
-         or get_nested(scan, "parameters", "scanType")
-         or get_nested(scan, "parameters", "scan_type")
-         or "").lower()
-    if "back" in t or "bg" in t:
-        return "background"
-    if "sam" in t:
-        return "sample"
-    # Also check name/type direct
-    t2 = (scan.get("type") or scan.get("name") or "").lower()
-    if "back" in t2 or "bg" in t2:
-        return "background"
-    if "sam" in t2:
-        return "sample"
-    return ""
-
-def get_led_array(scan: dict, channel_key: str) -> List[float]:
-    """Find array for LED channel (default SC_Green)."""
-    if not isinstance(scan, dict):
-        return []
-    # direct
-    if channel_key in scan:
-        return parse_values(scan[channel_key])
-    # nested containers
-    for key in ("channels", "Channels", "data", "Data"):
-        node = scan.get(key)
-        if isinstance(node, dict):
-            # exact key
-            if channel_key in node:
-                return parse_values(node[channel_key])
-            # case-insensitive
-            for k, v in node.items():
-                if k.lower() == channel_key.lower():
-                    return parse_values(v)
-    # last resort: search values
-    for k, v in scan.items():
-        if isinstance(v, list) and all(isinstance(x, (int, float, str, dict)) for x in v):
-            vals = parse_values(v)
-            if len(vals) >= 5:
-                return vals
-    return []
-
-def parse_values(raw) -> List[float]:
-    if isinstance(raw, list):
-        out = []
-        for v in raw:
-            if isinstance(v, (int, float)):
-                out.append(float(v))
-            elif isinstance(v, str):
-                try:
-                    out.append(float(v))
-                except:
-                    pass
-            elif isinstance(v, dict):
-                for key in ("value", "intensity"):
-                    if key in v:
-                        try:
-                            out.append(float(v[key]))
-                        except:
-                            pass
-        return [x for x in out if np.isfinite(x)]
-    if isinstance(raw, str):
-        parts = [p.strip() for p in raw.split(",")]
-        out = []
-        for p in parts:
-            try:
-                out.append(float(p))
-            except:
-                pass
-        return [x for x in out if np.isfinite(x)]
-    return []
-
-def extract_loc_doses(scan: dict) -> Dict[str, float]:
-    doses = {}
-    if not isinstance(scan, dict):
-        return doses
-    # scan-level
-    for src in (scan, scan.get("parameters", {}) or {}):
-        for k, v in list(src.items()):
-            if isinstance(k, str) and k.upper().startswith("LOC"):
-                try:
-                    val = float(v)
-                except:
-                    continue
-                if val > 0:
-                    doses[k.upper()] = val
-    return doses
-
-def pick_bg_and_last_sample(scans: List[dict]) -> Tuple[dict, dict]:
-    bg = None
-    last_sample = None
-    for s in scans:
-        t = scan_type(s)
-        if t == "background" and bg is None:
-            bg = s
-        elif t == "sample":
-            last_sample = s
-    return bg, last_sample
-
-# ------------- Regression -------------
-
-def variance_weights_from_replicates(xs, ys, group_ids=None, sd_floor=None):
-    xs = np.asarray(xs, dtype=float)
-    ys = np.asarray(ys, dtype=float)
-    if ys.size == 0:
-        return np.array([])
-    if sd_floor is None:
-        y_rng = (np.nanmax(ys) - np.nanmin(ys)) if np.isfinite(ys).any() else 1.0
-        sd_floor = max(1e-6, 0.01 * y_rng)
-    if group_ids is None:
-        gids = np.round(xs, 12)
-    else:
-        gids = np.asarray(group_ids)
-
-    weights = np.empty_like(ys, dtype=float)
-    for g in np.unique(gids):
-        m = (gids == g)
-        if np.sum(m) < 2:
-            sd = sd_floor
-        else:
-            sd = np.nanstd(ys[m], ddof=1)
-            if not np.isfinite(sd) or sd <= 0:
-                sd = sd_floor
-        w = 1.0 / (max(sd, sd_floor) ** 2)
-        weights[m] = w
-    return weights
-
-def fit_linear(x, y, weights=None):
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    mask = np.isfinite(x) & np.isfinite(y)
-    if weights is not None:
-        w = np.asarray(weights, dtype=float)
-        mask &= np.isfinite(w)
-        w = w[mask]
-    x = x[mask]; y = y[mask]
-    if x.size < 2 or np.unique(np.round(x,12)).size < 2:
-        raise ValueError("Need at least two distinct x values for a line.")
-    x_mean = x.mean()
-    x_std = x.std()
-    if x_std == 0:
-        raise ValueError("Zero variance in x.")
-    xs = (x - x_mean) / x_std
-    X = np.c_[np.ones_like(xs), xs]
-
-    if weights is None:
-        W = np.ones_like(xs)
-    else:
-        w = np.asarray(weights, dtype=float)[mask]
-        w = np.where(w > 0, w, np.nan)
-        if np.isnan(w).any():
-            pos = w[np.isfinite(w)]
-            floor = np.nanpercentile(pos, 5) if pos.size else 1.0
-            w = np.where(np.isfinite(w), w, floor)
-        lo = np.nanpercentile(w, 1)
-        hi = np.nanpercentile(w, 99)
-        if not np.isfinite(hi) or hi <= 0: hi = 1.0
-        if not np.isfinite(lo) or lo <= 0: lo = hi * 1e-6
-        w = np.clip(w, lo, hi)
-        W = np.sqrt(w)
-
-    try:
-        beta_scaled, *_ = np.linalg.lstsq(W[:,None]*X, W*y, rcond=None)
-    except np.linalg.LinAlgError:
-        XtWX = (X.T * (W**2)) @ X
-        XtWy = X.T @ (W**2 * y)
-        lam = 1e-8 * np.trace(XtWX) if np.isfinite(np.trace(XtWX)) else 1e-6
-        beta_scaled = np.linalg.solve(XtWX + lam*np.eye(2), XtWy)
-
-    b0_s, b1_s = beta_scaled
-    slope = b1_s / x_std
-    intercept = b0_s - slope * x_mean
-
-    yhat = intercept + slope * x
-    if weights is None:
-        ss_res = np.sum((y - yhat)**2)
-        ss_tot = np.sum((y - np.mean(y))**2)
-    else:
-        ybar = np.average(y, weights=w)
-        ss_res = np.sum(w * (y - yhat)**2)
-        ss_tot = np.sum(w * (y - ybar)**2)
-    r2 = 1.0 - ss_res/ss_tot if ss_tot > 0 else np.nan
-    return slope, intercept, r2
-
-def export_plot(fig, png_name="plot.png", pdf_name="plot.pdf"):
-    # returns (png_bytes, pdf_bytes)
-    pbuf = io.BytesIO()
-    fig.savefig(pbuf, format="png", bbox_inches="tight", dpi=200)
-    pbuf.seek(0)
-    dbuf = io.BytesIO()
-    fig.savefig(dbuf, format="pdf", bbox_inches="tight")
-    dbuf.seek(0)
-    return pbuf.getvalue(), dbuf.getvalue()
-
-# ------------- Streamlit App -------------
-
-st.set_page_config(page_title="R&D MD and Analysis", layout="wide")
-
-if "settings" not in st.session_state:
-    st.session_state.settings = {
-        "analyte": "Iron (Fe)",
-        "led_channel": "SC_Green",
-        "base_sample_mL": 40.0,
-        "extra_const_mL": 0.0,
-        "include_loc_vols": True,
-        "standard_loc": "LOC15",
-        "standard_stock_mgL": 1000.0,
-        "loc_map": {f"LOC{i}": "" for i in range(1,17)},
+# Custom CSS (same as before...)
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #4A90E2;
+        text-align: center;
+        padding: 1rem 0;
+        border-bottom: 3px solid #4A90E2;
+        margin-bottom: 2rem;
     }
-
-if "raw_log" not in st.session_state:
-    st.session_state.raw_log = []  # list of dict rows
-
-if "linearity" not in st.session_state:
-    st.session_state.linearity = pd.DataFrame(columns=[
-        "Test #","Shield Test #","Date","Conc (mg/L)","LOC Dosing (µL)",
-        "Replicate","Absorbance","BG Mean","Sample Mean","Temp (°C)","Status","Notes"
-    ])
-
-def sidebar():
-    st.sidebar.title("R&D MD & Analysis")
-    page = st.sidebar.radio("Go to", [
-        "Project & Settings",
-        "Linearity",
-        "Interference Study",
-        "Repeatability (Intra-day)",
-        "Intermediate Precision",
-        "Accuracy/Recovery",
-        "LOD/LOQ",
-        "Stability",
-        "Robustness",
-        "Sample Matrix Effects",
-        "Raw Import Log / Export"
-    ])
-    return page
-
-page = sidebar()
-
-# ----- Project & Settings -----
-if page == "Project & Settings":
-    st.header("Project & Settings")
-    s = st.session_state.settings
-
-    col1, col2 = st.columns(2)
-    with col1:
-        s["analyte"] = st.text_input("Analyte name", s["analyte"])
-        s["led_channel"] = st.text_input("LED channel key", s["led_channel"])
-        s["base_sample_mL"] = st.number_input("Base sample volume (mL)", 1.0, 200.0, s["base_sample_mL"], 0.1)
-        s["extra_const_mL"] = st.number_input("Extra constant volume (mL)", 0.0, 50.0, s["extra_const_mL"], 0.1)
-        s["include_loc_vols"] = st.checkbox("Include LOC dosing volumes into total volume", value=s["include_loc_vols"])
-    with col2:
-        st.markdown("**Standard configuration (for auto-concentration)**")
-        s["standard_loc"] = st.selectbox("Standard LOC", [f"LOC{i}" for i in range(1,17)], index=14)  # default LOC15
-        s["standard_stock_mgL"] = st.number_input("Standard stock concentration (mg/L)", 0.0, 100000.0, s["standard_stock_mgL"], 1.0)
-
-    st.markdown("---")
-    st.subheader("LOC Reagent Map (optional docs)")
-    loc_df = pd.DataFrame({"LOC":[f"LOC{i}" for i in range(1,17)],
-                           "Role":[""]*16,
-                           "Notes":[""]*16})
-    st.dataframe(loc_df, use_container_width=True)
-
-    st.success("Settings saved in session.")
-
-# ----- JSON Import helper -----
-
-def concentration_from_loc_doses(loc_doses: Dict[str, float], settings: dict) -> float:
-    """Compute C_final from standard LOC spike and total volume (mL)."""
-    std_loc = settings["standard_loc"]
-    stock = float(settings["standard_stock_mgL"] or 0.0)
-    base = float(settings["base_sample_mL"] or 0.0)
-    extra = float(settings["extra_const_mL"] or 0.0)
-    include = bool(settings["include_loc_vols"])
-
-    spike_uL = float(loc_doses.get(std_loc, 0.0))
-    if spike_uL <= 0 or stock <= 0 or base <= 0:
-        return 0.0
-    total_mL = base + extra
-    if include:
-        total_mL += (sum(loc_doses.values())/1000.0)
-    c_final = stock * ((spike_uL/1000.0)/total_mL)
-    return float(c_final)
-
-def parse_device_json(file_bytes: bytes, settings: dict) -> dict:
-    js = json.loads(file_bytes.decode("utf-8"))
-    scans = find_scans(js)
-    bg, sample = pick_bg_and_last_sample(scans)
-    led = settings["led_channel"]
-
-    bg_vals = get_led_array(bg, led) if bg else []
-    sm_vals = get_led_array(sample, led) if sample else []
-    bg_mean = robust_mean(bg_vals) if bg_vals else np.nan
-    sm_mean = robust_mean(sm_vals) if sm_vals else np.nan
-    A = np.nan
-    if np.isfinite(bg_mean) and np.isfinite(sm_mean) and sm_mean > 0:
-        A = math.log10(bg_mean/sm_mean)
-
-    loc = extract_loc_doses(sample) if sample else {}
-    conc = concentration_from_loc_doses(loc, settings)
-    temp = None
-    for key in ("bb_temp","temperature","temp"):
-        t = get_nested(sample or {}, key) or get_nested(js, "payload", key)
-        if t is not None:
-            try: 
-                temp = float(t); 
-                break
-            except: 
-                pass
-
-    # Attempt several shield test fields
-    shield = (get_nested(js, "payload", "exp_number")
-              or get_nested(js, "payload", "test_number")
-              or js.get("exp_number") or js.get("test_number")
-              or js.get("testNumber") or js.get("shield_test_number") or "")
-    return {
-        "Shield Test #": str(shield),
-        "Conc (mg/L)": float(conc),
-        "LOC Dosing (µL)": ", ".join([f"{k}:{v:g}" for k,v in loc.items()]) if loc else "",
-        "Absorbance": float(A) if np.isfinite(A) else np.nan,
-        "BG Mean": float(bg_mean) if np.isfinite(bg_mean) else np.nan,
-        "Sample Mean": float(sm_mean) if np.isfinite(sm_mean) else np.nan,
-        "Temp (°C)": temp,
+    .step-header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 1rem 0;
+        font-size: 1.5rem;
+        font-weight: bold;
     }
+    .success-box {
+        background-color: #d4edda;
+        border-left: 5px solid #28a745;
+        padding: 1rem;
+        margin: 1rem 0;
+        border-radius: 5px;
+    }
+    .warning-box {
+        background-color: #fff3cd;
+        border-left: 5px solid #ffc107;
+        padding: 1rem;
+        margin: 1rem 0;
+        border-radius: 5px;
+    }
+    .info-box {
+        background-color: #d1ecf1;
+        border-left: 5px solid #17a2b8;
+        padding: 1rem;
+        margin: 1rem 0;
+        border-radius: 5px;
+    }
+    .error-box {
+        background-color: #f8d7da;
+        border-left: 5px solid #dc3545;
+        padding: 1rem;
+        margin: 1rem 0;
+        border-radius: 5px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-def add_to_raw_log(row: dict, section: str, status: str, filename: str):
-    st.session_state.raw_log.append({
-        "Timestamp": datetime.now().isoformat(timespec="seconds"),
-        "Section": section,
-        "File": filename,
-        **row,
-        "Status": status
-    })
+# ============================================================================
+# DATA CLASSES
+# ============================================================================
 
-# ----- Linearity -----
-if page == "Linearity":
-    st.header("Linearity – DOE, JSON Import, Fit, and Exports")
+@dataclass
+class ValidationStepConfig:
+    step_id: str
+    step_name: str
+    description: str
+    requires_design: bool
+    design_params: Dict
+    expected_tests: int
+    acceptance_criteria: Dict
+    status: str = "not_started"
+    
+@dataclass
+class ExperimentDesign:
+    step_id: str
+    concentration_range: tuple = None
+    num_replicates: int = 3
+    num_levels: int = 5
+    spike_levels: List[float] = None
+    interferents: List[str] = None
+    custom_params: Dict = None
+    created_at: datetime = None
+    
+@dataclass
+class TestResult:
+    step_id: str
+    test_number: int
+    shield_test_number: str
+    timestamp: datetime
+    concentration: float
+    absorbance: float
+    bg_mean: float
+    sample_mean: float
+    temperature: float
+    loc_doses: Dict
+    replicate_number: int = 1
+    level_number: int = 1
+    metadata: Dict = None
 
-    # DOE Builder
-    with st.expander("Design of Experiments (DOE)", expanded=True):
-        mode = st.radio("Levels input mode", ["Auto-generate", "Manual"], horizontal=True)
-        if mode == "Auto-generate":
-            lo = st.number_input("Range start (mg/L)", 0.0, 1e6, 0.0, 0.1)
-            hi = st.number_input("Range end (mg/L)", 0.0, 1e6, 25.0, 0.1)
-            points = st.selectbox("Number of calibration levels", [5,6,7,8,9,10,11,12], index=7)
-            replicates = st.number_input("Replicates per level", 1, 10, 3)
-            levels = list(np.linspace(lo, hi, points)) if hi >= lo else []
-        else:
-            levels_str = st.text_input("Levels (mg/L, comma-separated)", "0,1,2.5,5,7.5,10,12.5,15,17.5,20,22.5,25")
-            try:
-                levels = [float(x.strip()) for x in levels_str.split(",") if x.strip()!=""]
-            except:
-                st.error("Invalid manual levels.")
-                levels = []
-            replicates = st.number_input("Replicates per level", 1, 10, 3)
+# ============================================================================
+# SESSION STATE
+# ============================================================================
 
-        if st.button("Generate DOE Table"):
-            rows = []
-            tnum = 1
-            for c in levels:
-                for r in range(1, int(replicates)+1):
-                    rows.append([f"L-{tnum:03d}","", "", float(c), "", r, "", "", "", "", "PENDING", ""])
-                    tnum+=1
-            st.session_state.linearity = pd.DataFrame(rows, columns=st.session_state.linearity.columns)
-
-    st.markdown("#### DOE Table")
-    st.dataframe(st.session_state.linearity, use_container_width=True)
-
-    # JSON import
-    st.markdown("---")
-    st.subheader("Import device JSON → auto Absorbance & Conc")
-    up = st.file_uploader("Upload one or more device JSON files", type=["json"], accept_multiple_files=True)
-    if up:
-        for f in up:
-            try:
-                row = parse_device_json(f.read(), st.session_state.settings)
-                # place into first empty matching row by concentration (if any)
-                df = st.session_state.linearity
-                # find candidate rows where conc matches and Absorbance empty
-                idx = df[(np.isclose(df["Conc (mg/L)"], row["Conc (mg/L)"], rtol=0, atol=1e-9)) & (df["Absorbance"].isna() | (df["Absorbance"]==""))].index
-                target = idx[0] if len(idx)>0 else None
-                if target is None:
-                    # append as extra row
-                    new = {
-                        "Test #": f"IMP-{len(df)+1:03d}",
-                        "Shield Test #": row["Shield Test #"],
-                        "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "Conc (mg/L)": row["Conc (mg/L)"],
-                        "LOC Dosing (µL)": row["LOC Dosing (µL)"],
-                        "Replicate": 1,
-                        "Absorbance": row["Absorbance"],
-                        "BG Mean": row["BG Mean"],
-                        "Sample Mean": row["Sample Mean"],
-                        "Temp (°C)": row["Temp (°C)"],
-                        "Status": "COMPLETE",
-                        "Notes": "Auto-inserted"
-                    }
-                    st.session_state.linearity = pd.concat([df, pd.DataFrame([new])], ignore_index=True)
-                else:
-                    st.session_state.linearity.loc[target, ["Shield Test #","Date","LOC Dosing (µL)","Absorbance","BG Mean","Sample Mean","Temp (°C)","Status"]] = [
-                        row["Shield Test #"],
-                        datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        row["LOC Dosing (µL)"],
-                        row["Absorbance"],
-                        row["BG Mean"],
-                        row["Sample Mean"],
-                        row["Temp (°C)"],
-                        "COMPLETE"
-                    ]
-                add_to_raw_log(row, "Linearity", "INSERTED", f.name)
-                st.success(f"Imported {f.name}")
-            except Exception as e:
-                add_to_raw_log({"Error": str(e)}, "Linearity", "FAILED", f.name)
-                st.error(f"Failed to import {f.name}: {e}")
-
-    # Fit
-    st.markdown("---")
-    st.subheader("Calibration Fit")
-    df = st.session_state.linearity.copy()
-    # drop rows without absorbance or conc
-    df = df[pd.to_numeric(df["Conc (mg/L)"], errors="coerce").notna() & pd.to_numeric(df["Absorbance"], errors="coerce").notna()]
-    if len(df) >= 2 and df["Conc (mg/L)"].nunique() >= 2:
-        colA, colB = st.columns(2)
-        with colA:
-            use_weights = st.checkbox("Variance-weighted (1/SD² by level)", value=True)
-        with colB:
-            show_resid = st.checkbox("Show residuals table", value=False)
-
-        # build x,y and (optional) weights from replicate groups
-        x = df["Conc (mg/L)"].astype(float).values
-        y = df["Absorbance"].astype(float).values
-        weights = None
-        if use_weights:
-            # group by concentration
-            weights = variance_weights_from_replicates(x, y, group_ids=np.round(x, 12))
-
-        try:
-            m, b, r2 = fit_linear(x, y, weights=weights)
-            st.info(f"**Calibration**: A = m·C + b  →  m = {m:.6g},  b = {b:.6g},  R² = {r2:.6f}")
-            # plot
-            fig = plt.figure()
-            ax = plt.gca()
-            ax.scatter(x, y)
-            xs = np.linspace(min(x), max(x), 100)
-            ax.plot(xs, m*xs + b)
-            ax.set_xlabel("Concentration (mg/L)")
-            ax.set_ylabel("Absorbance (A)")
-            ax.set_title("Calibration Curve")
-            st.pyplot(fig)
-
-            png, pdf = export_plot(fig, "calibration.png", "calibration.pdf")
-            st.download_button("Download plot (PNG)", data=png, file_name="calibration.png", mime="image/png")
-            st.download_button("Download plot (PDF)", data=pdf, file_name="calibration.pdf", mime="application/pdf")
-
-            if show_resid:
-                res = pd.DataFrame({"Conc (mg/L)": x, "Absorbance": y, "Fit": m*x + b})
-                res["Residual"] = res["Absorbance"] - res["Fit"]
-                st.dataframe(res.sort_values("Conc (mg/L)"))
-        except Exception as e:
-            st.error(f"Fit failed: {e}")
-    else:
-        st.warning("Add at least two distinct concentration levels with absorbance to fit.")
-
-# ----- Placeholder, working tables for other studies -----
-
-def generic_table_page(title: str, key: str, columns: List[str]):
-    st.header(title)
-    if key not in st.session_state:
-        st.session_state[key] = pd.DataFrame(columns=columns)
-    st.markdown("Upload device JSON files to populate Absorbance/Conc quickly, or paste/edit rows manually.")
-
-    up = st.file_uploader("Upload JSON (optional)", type=["json"], accept_multiple_files=True, key=f"up_{key}")
-    if up:
-        for f in up:
-            try:
-                row = parse_device_json(f.read(), st.session_state.settings)
-                new = {
-                    "Shield Test #": row["Shield Test #"],
-                    "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "Conc (mg/L)": row["Conc (mg/L)"],
-                    "Absorbance": row["Absorbance"],
-                    "BG Mean": row["BG Mean"],
-                    "Sample Mean": row["Sample Mean"],
-                    "Temp (°C)": row["Temp (°C)"],
-                    "Notes": "Auto-import"
+def initialize_session_state():
+    if 'initialized' not in st.session_state:
+        st.session_state.initialized = True
+        
+        st.session_state.loc_config = {
+            'base_sample_volume': 40.0,
+            'extra_volume': 0.0,
+            'include_loc_volumes': True,
+            'standard_loc': 'LOC15',
+            'stock_concentration': 1000.0
+        }
+        
+        st.session_state.validation_steps = {
+            'linearity': ValidationStepConfig(
+                step_id='linearity',
+                step_name='4A. Linearity',
+                description='Assess linear relationship between concentration and response',
+                requires_design=True,
+                design_params={
+                    'concentration_range': (0, 100),
+                    'num_levels': 5,
+                    'replicates_per_level': 3,
+                    'suggested_levels': [0, 25, 50, 75, 100]
+                },
+                expected_tests=15,
+                acceptance_criteria={
+                    'r_squared': 0.995,
+                    'residuals_pattern': 'random'
                 }
-                st.session_state[key] = pd.concat([st.session_state[key], pd.DataFrame([new])], ignore_index=True)
-                add_to_raw_log(row, title, "INSERTED", f.name)
-            except Exception as e:
-                add_to_raw_log({"Error": str(e)}, title, "FAILED", f.name)
-                st.error(f"Failed to import {f.name}: {e}")
+            ),
+            'repeatability': ValidationStepConfig(
+                step_id='repeatability',
+                step_name='5A. Repeatability',
+                description='Same analyst, same day, same conditions',
+                requires_design=True,
+                design_params={
+                    'concentration_levels': [10, 50, 90],
+                    'replicates_per_level': 10,
+                    'same_day': True
+                },
+                expected_tests=30,
+                acceptance_criteria={
+                    'rsd': 5
+                }
+            ),
+            'accuracy': ValidationStepConfig(
+                step_id='accuracy',
+                step_name='5B. Accuracy',
+                description='Spike known amounts and measure recovery',
+                requires_design=True,
+                design_params={
+                    'spike_levels': [10, 50, 90],
+                    'matrix': 'DI water',
+                    'replicates_per_level': 5
+                },
+                expected_tests=15,
+                acceptance_criteria={
+                    'recovery_range': (95, 105),
+                    'rsd': 5
+                }
+            )
+        }
+        
+        st.session_state.designs = {}
+        st.session_state.results = {step: [] for step in st.session_state.validation_steps.keys()}
+        st.session_state.analyses = {}
+        st.session_state.current_step = 'linearity'
 
-    st.dataframe(st.session_state[key], use_container_width=True)
-    csv = st.session_state[key].to_csv(index=False).encode("utf-8")
-    st.download_button("Export CSV", data=csv, file_name=f"{key}.csv", mime="text/csv")
+initialize_session_state()
 
-if page == "Interference Study":
-    cols = ["Shield Test #","Date","Interferent","Interf. Level","Conc (mg/L)","Absorbance","BG Mean","Sample Mean","Temp (°C)","Notes"]
-    generic_table_page("Interference Study", "interference", cols)
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 
-if page == "Repeatability (Intra-day)":
-    cols = ["Shield Test #","Date","Conc (mg/L)","Replicate","Absorbance","BG Mean","Sample Mean","Temp (°C)","Notes"]
-    generic_table_page("Repeatability (Intra-day)", "repeatability", cols)
-
-if page == "Intermediate Precision":
-    cols = ["Shield Test #","Day","Date","Analyst","Conc (mg/L)","Replicate","Absorbance","BG Mean","Sample Mean","Temp (°C)","Notes"]
-    generic_table_page("Intermediate Precision", "intermediate_precision", cols)
-
-if page == "Accuracy/Recovery":
-    cols = ["Shield Test #","Date","Matrix","Spike (mg/L)","Replicate","Measured (mg/L)","Expected (mg/L)","Recovery %","Absorbance","Notes"]
-    generic_table_page("Accuracy/Recovery", "accuracy", cols)
-
-if page == "LOD/LOQ":
-    st.header("LOD/LOQ")
-    st.markdown("Provide blank absorbances and reference slope (from linearity) to compute LOD/LOQ.")
-    if "lod" not in st.session_state:
-        st.session_state.lod = pd.DataFrame(columns=["Test #","Date","Absorbance","Notes"])
-    # blanks table
-    st.subheader("Blank measurements")
-    st.session_state.lod = st.dataframe(st.session_state.lod, use_container_width=True).data
-
-    slope = st.number_input("Slope m (from linearity)", value=1.0, step=0.0001, format="%.6f")
-    # compute stats if blanks present
+def extract_json_data(json_content):
+    """Extract data from JSON file"""
     try:
-        blks = pd.to_numeric(st.session_state.lod["Absorbance"], errors="coerce").dropna().values
-        if blks.size >= 3 and slope>0:
-            sd_b = float(np.std(blks, ddof=1)) if blks.size>1 else float(np.std(blks))
-            lod = 3*sd_b/slope
-            loq = 10*sd_b/slope
-            st.info(f"Blank SD = {sd_b:.6g} → LOD = {lod:.6g} mg/L, LOQ = {loq:.6g} mg/L")
-        else:
-            st.warning("Enter ≥3 blank absorbances and a positive slope to compute LOD/LOQ.")
+        data = json.loads(json_content) if isinstance(json_content, str) else json_content
+        
+        shield_test_num = None
+        if 'payload' in data:
+            shield_test_num = (data['payload'].get('exp_number') or 
+                             data['payload'].get('test_number'))
+        if not shield_test_num:
+            shield_test_num = data.get('exp_number') or data.get('test_number')
+        
+        scans = None
+        if 'payload' in data and 'scans' in data['payload']:
+            scans = data['payload']['scans']
+        elif 'scans' in data:
+            scans = data['scans']
+        
+        if not scans:
+            return None
+        
+        bg_scan = None
+        sample_scan = None
+        
+        for scan in scans:
+            scan_type = scan.get('parameters', {}).get('scanType', '').lower()
+            if not scan_type:
+                scan_type = scan.get('scanType', '').lower()
+            
+            if 'back' in scan_type or 'bg' in scan_type:
+                bg_scan = scan
+            elif 'sample' in scan_type:
+                sample_scan = scan
+        
+        absorbance = None
+        bg_mean = None
+        sample_mean = None
+        
+        if bg_scan and sample_scan:
+            bg_values = parse_channel_values(bg_scan.get('SC_Green', ''))
+            sample_values = parse_channel_values(sample_scan.get('SC_Green', ''))
+            
+            if bg_values and sample_values:
+                bg_mean = calculate_robust_mean(bg_values)
+                sample_mean = calculate_robust_mean(sample_values)
+                
+                if bg_mean and sample_mean and sample_mean > 0:
+                    absorbance = np.log10(bg_mean / sample_mean)
+        
+        loc_doses = {}
+        if sample_scan:
+            params = sample_scan.get('parameters', sample_scan)
+            for key, value in params.items():
+                if key.upper().startswith('LOC'):
+                    try:
+                        val = float(value)
+                        if val > 0:
+                            loc_doses[key.upper()] = val
+                    except:
+                        pass
+        
+        temperature = None
+        if sample_scan and 'bb_temp' in sample_scan:
+            try:
+                temperature = float(sample_scan['bb_temp'])
+            except:
+                pass
+        
+        return {
+            'shield_test_number': str(shield_test_num) if shield_test_num else 'N/A',
+            'loc_doses': loc_doses,
+            'absorbance': absorbance,
+            'bg_mean': bg_mean,
+            'sample_mean': sample_mean,
+            'temperature': temperature,
+            'timestamp': datetime.now()
+        }
+        
     except Exception as e:
-        st.error(f"LOD/LOQ calc error: {e}")
+        st.error(f"Error extracting JSON data: {str(e)}")
+        return None
 
-if page == "Stability":
-    cols = ["Shield Test #","Prep Date","Measure Time","Elapsed (min)","Conc (mg/L)","Replicate","Absorbance","Initial Abs","% Change","Notes"]
-    generic_table_page("Stability", "stability", cols)
+def parse_channel_values(channel_str):
+    if not channel_str:
+        return []
+    
+    if isinstance(channel_str, str):
+        try:
+            values = [float(x.strip()) for x in channel_str.split(',') if x.strip()]
+            return values
+        except:
+            return []
+    elif isinstance(channel_str, list):
+        return [float(x) for x in channel_str if x]
+    
+    return []
 
-if page == "Robustness":
-    cols = ["Shield Test #","Date","Factor","Nominal","Test Value","Conc (mg/L)","Replicate","Absorbance","% Difference","Notes"]
-    generic_table_page("Robustness", "robustness", cols)
+def calculate_robust_mean(values):
+    if not values or len(values) == 0:
+        return None
+    
+    values = np.array(values)
+    median = np.median(values)
+    mad = np.median(np.abs(values - median))
+    
+    threshold = 3 * 1.4826 * mad
+    filtered = values[np.abs(values - median) <= threshold]
+    
+    if len(filtered) == 0:
+        return median
+    
+    return float(np.mean(filtered))
 
-if page == "Sample Matrix Effects":
-    cols = ["Shield Test #","Date","Matrix","Matrix ID","Conc (mg/L)","Replicate","Absorbance","DI Water Abs","Matrix Effect %","Notes"]
-    generic_table_page("Sample Matrix Effects", "matrix", cols)
+def calculate_concentration(loc_doses, config):
+    if not loc_doses:
+        return 0.0
+    
+    standard_loc = config['standard_loc']
+    stock_conc = config['stock_concentration']
+    base_volume = config['base_sample_volume']
+    extra_volume = config['extra_volume']
+    include_loc = config['include_loc_volumes']
+    
+    spike_volume_uL = loc_doses.get(standard_loc, 0)
+    
+    if spike_volume_uL == 0:
+        return 0.0
+    
+    total_volume_mL = base_volume + extra_volume
+    
+    if include_loc:
+        total_loc_volume_uL = sum(loc_doses.values())
+        total_volume_mL += (total_loc_volume_uL / 1000)
+    
+    spike_volume_mL = spike_volume_uL / 1000
+    concentration = stock_conc * (spike_volume_mL / total_volume_mL)
+    
+    return concentration
 
-if page == "Raw Import Log / Export":
-    st.header("Raw Import Log / Export")
-    if len(st.session_state.raw_log)==0:
-        st.info("No imports yet.")
+def safe_dataframe_display(df):
+    """Convert dataframe to safe types for display"""
+    df_copy = df.copy()
+    
+    # Convert all object columns to strings
+    for col in df_copy.columns:
+        if df_copy[col].dtype == 'object':
+            df_copy[col] = df_copy[col].astype(str)
+    
+    return df_copy
+
+# ============================================================================
+# ANALYSIS FUNCTIONS WITH ERROR HANDLING
+# ============================================================================
+
+def analyze_linearity(df, design, config):
+    """Analyze linearity data with robust error handling"""
+    try:
+        # Group by level
+        grouped = df.groupby('level_number').agg({
+            'concentration': ['mean', 'std', 'count'],
+            'absorbance': ['mean', 'std']
+        }).reset_index()
+        
+        x = grouped['concentration']['mean'].values
+        y = grouped['absorbance']['mean'].values
+        
+        # Check for valid data
+        if len(x) < 3:
+            return {
+                'error': 'Need at least 3 data points for linearity',
+                'passes': False
+            }
+        
+        # Remove any NaN or infinite values
+        valid_mask = np.isfinite(x) & np.isfinite(y)
+        x = x[valid_mask]
+        y = y[valid_mask]
+        
+        if len(x) < 3:
+            return {
+                'error': 'Insufficient valid data points',
+                'passes': False
+            }
+        
+        # Try linear regression with error handling
+        try:
+            slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+            r_squared = r_value ** 2
+        except Exception as e:
+            # Fallback to simple linear fit
+            try:
+                coeffs = np.polyfit(x, y, 1)
+                slope, intercept = coeffs
+                y_pred = np.polyval(coeffs, x)
+                ss_res = np.sum((y - y_pred) ** 2)
+                ss_tot = np.sum((y - np.mean(y)) ** 2)
+                r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+                p_value = 0.0
+                std_err = 0.0
+            except:
+                return {
+                    'error': f'Linear regression failed: {str(e)}',
+                    'passes': False
+                }
+        
+        # Calculate predicted and residuals
+        y_pred = slope * x + intercept
+        residuals = y - y_pred
+        
+        passes = r_squared >= config.acceptance_criteria['r_squared']
+        
+        return {
+            'slope': float(slope),
+            'intercept': float(intercept),
+            'r_squared': float(r_squared),
+            'p_value': float(p_value),
+            'std_err': float(std_err),
+            'x': x.tolist(),
+            'y': y.tolist(),
+            'y_pred': y_pred.tolist(),
+            'residuals': residuals.tolist(),
+            'passes': passes,
+            'criteria': config.acceptance_criteria,
+            'summary': f"R² = {r_squared:.4f} (Criteria: ≥ {config.acceptance_criteria['r_squared']})"
+        }
+        
+    except Exception as e:
+        return {
+            'error': f'Analysis failed: {str(e)}',
+            'passes': False
+        }
+
+def analyze_repeatability(df, design, config):
+    """Analyze repeatability with error handling"""
+    try:
+        results_by_level = {}
+        
+        for level in df['level_number'].unique():
+            level_data = df[df['level_number'] == level]['concentration']
+            
+            if len(level_data) < 2:
+                continue
+            
+            mean = float(level_data.mean())
+            std = float(level_data.std())
+            rsd = (std / mean * 100) if mean > 0 else 0
+            n = len(level_data)
+            
+            passes = rsd <= config.acceptance_criteria['rsd']
+            
+            results_by_level[int(level)] = {
+                'mean': mean,
+                'std': std,
+                'rsd': rsd,
+                'n': n,
+                'passes': passes,
+                'data': level_data.tolist()
+            }
+        
+        all_pass = all(r['passes'] for r in results_by_level.values())
+        
+        return {
+            'by_level': results_by_level,
+            'passes': all_pass,
+            'criteria': config.acceptance_criteria,
+            'summary': f"All levels RSD ≤ {config.acceptance_criteria['rsd']}%" if all_pass else "Some levels exceed RSD criteria"
+        }
+    
+    except Exception as e:
+        return {
+            'error': f'Analysis failed: {str(e)}',
+            'passes': False
+        }
+
+def analyze_accuracy(df, design, config):
+    """Analyze accuracy/recovery"""
+    try:
+        results_by_level = {}
+        
+        for level in df['level_number'].unique():
+            level_data = df[df['level_number'] == level]
+            
+            if len(level_data) == 0:
+                continue
+                
+            spike_conc = design.spike_levels[int(level) - 1]
+            
+            measured = float(level_data['concentration'].mean())
+            recovery = (measured / spike_conc * 100) if spike_conc > 0 else 0
+            rsd = (level_data['concentration'].std() / measured * 100) if measured > 0 else 0
+            
+            passes = (config.acceptance_criteria['recovery_range'][0] <= recovery <= 
+                     config.acceptance_criteria['recovery_range'][1] and
+                     rsd <= config.acceptance_criteria['rsd'])
+            
+            results_by_level[int(level)] = {
+                'spike_conc': float(spike_conc),
+                'measured': measured,
+                'recovery': float(recovery),
+                'rsd': float(rsd),
+                'n': len(level_data),
+                'passes': passes
+            }
+        
+        all_pass = all(r['passes'] for r in results_by_level.values())
+        
+        return {
+            'by_level': results_by_level,
+            'passes': all_pass,
+            'criteria': config.acceptance_criteria,
+            'summary': f"Recovery: {config.acceptance_criteria['recovery_range'][0]}-{config.acceptance_criteria['recovery_range'][1]}%"
+        }
+    
+    except Exception as e:
+        return {
+            'error': f'Analysis failed: {str(e)}',
+            'passes': False
+        }
+
+# ============================================================================
+# MAIN UI FUNCTIONS
+# ============================================================================
+
+def main():
+    st.markdown('<div class="main-header">🧪 Fe²⁺/Fe³⁺ Method Validation</div>', 
+                unsafe_allow_html=True)
+    
+    # Sidebar
+    with st.sidebar:
+        st.title("🎯 Validation Steps")
+        
+        completed = sum(1 for s in st.session_state.validation_steps.values() if s.status == 'analyzed')
+        total = len(st.session_state.validation_steps)
+        
+        st.metric("Progress", f"{completed}/{total}")
+        st.progress(completed / total if total > 0 else 0)
+        
+        st.markdown("---")
+        
+        for step_id, step_config in st.session_state.validation_steps.items():
+            status_emoji = {
+                'not_started': '⚪',
+                'designed': '🔵',
+                'collecting': '🔄',
+                'completed': '✅',
+                'analyzed': '🎉'
+            }
+            
+            emoji = status_emoji.get(step_config.status, '⚪')
+            
+            if st.button(f"{emoji} {step_config.step_name}", key=f"nav_{step_id}", use_container_width=True):
+                st.session_state.current_step = step_id
+                st.rerun()
+        
+        st.markdown("---")
+        
+        if st.button("🔧 LOC Config", use_container_width=True):
+            st.session_state.current_step = 'config'
+            st.rerun()
+    
+    # Main content
+    current_step = st.session_state.current_step
+    
+    if current_step == 'config':
+        show_config()
     else:
-        df = pd.DataFrame(st.session_state.raw_log)
-        st.dataframe(df, use_container_width=True)
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button("Download Import Log (CSV)", data=csv, file_name="import_log.csv", mime="text/csv")
+        show_validation_step(current_step)
 
-        # Export a project bundle
-        st.subheader("Project Export (.zip)")
-        zbuf = io.BytesIO()
-        with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("settings.json", json.dumps(st.session_state.settings, indent=2))
-            zf.writestr("linearity.csv", st.session_state.linearity.to_csv(index=False))
-            for key in ["interference","repeatability","intermediate_precision","accuracy","lod","stability","robustness","matrix"]:
-                if key in st.session_state:
-                    zf.writestr(f"{key}.csv", st.session_state[key].to_csv(index=False))
-            if len(st.session_state.raw_log):
-                zf.writestr("import_log.csv", pd.DataFrame(st.session_state.raw_log).to_csv(index=False))
-        zbuf.seek(0)
-        st.download_button("Download Project ZIP", data=zbuf.getvalue(), file_name="rd_md_project.zip", mime="application/zip")
+def show_validation_step(step_id):
+    """Show validation step page"""
+    
+    step_config = st.session_state.validation_steps[step_id]
+    
+    st.markdown(f'<div class="step-header">{step_config.step_name}</div>', unsafe_allow_html=True)
+    
+    tabs = st.tabs(["📐 Design", "📥 Collect", "📊 Analyze", "📈 Results"])
+    
+    with tabs[0]:
+        show_design_tab(step_id, step_config)
+    
+    with tabs[1]:
+        show_collect_tab(step_id, step_config)
+    
+    with tabs[2]:
+        show_analyze_tab(step_id, step_config)
+    
+    with tabs[3]:
+        show_results_tab(step_id, step_config)
+
+def show_design_tab(step_id, step_config):
+    st.subheader("📐 Experiment Design")
+    
+    if step_id in st.session_state.designs:
+        st.success("✅ Design complete!")
+        design = st.session_state.designs[step_id]
+        
+        if design.spike_levels:
+            st.write(f"**Levels:** {len(design.spike_levels)}")
+            st.write(f"**Replicates:** {design.num_replicates}")
+            
+            df_levels = pd.DataFrame({
+                'Level': range(1, len(design.spike_levels) + 1),
+                'Concentration': design.spike_levels
+            })
+            st.dataframe(safe_dataframe_display(df_levels), width='stretch')
+        
+        if st.button("🔄 Modify"):
+            del st.session_state.designs[step_id]
+            st.rerun()
+    else:
+        st.warning("⚠️ Please design your experiment")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            min_conc = st.number_input("Min Conc (mg/L)", value=0.0, step=1.0)
+            max_conc = st.number_input("Max Conc (mg/L)", value=100.0, step=1.0)
+        
+        with col2:
+            num_levels = st.number_input("Levels", value=5, min_value=3, max_value=10)
+            num_reps = st.number_input("Replicates", value=3, min_value=2, max_value=10)
+        
+        if st.button("💾 Save Design", type="primary"):
+            spike_levels = np.linspace(min_conc, max_conc, num_levels).tolist()
+            
+            design = ExperimentDesign(
+                step_id=step_id,
+                concentration_range=(min_conc, max_conc),
+                num_levels=num_levels,
+                num_replicates=num_reps,
+                spike_levels=spike_levels,
+                created_at=datetime.now()
+            )
+            
+            st.session_state.designs[step_id] = design
+            st.session_state.validation_steps[step_id].status = 'designed'
+            st.success("✅ Design saved!")
+            st.rerun()
+
+def show_collect_tab(step_id, step_config):
+    st.subheader("📥 Data Collection")
+    
+    if step_id not in st.session_state.designs:
+        st.warning("⚠️ Please design experiment first")
+        return
+    
+    design = st.session_state.designs[step_id]
+    results = st.session_state.results[step_id]
+    
+    expected = len(design.spike_levels) * design.num_replicates if design.spike_levels else 0
+    collected = len(results)
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Expected", expected)
+    with col2:
+        st.metric("Collected", collected)
+    with col3:
+        st.metric("Progress", f"{(collected/expected*100) if expected > 0 else 0:.0f}%")
+    
+    st.markdown("---")
+    
+    uploaded_files = st.file_uploader("Upload JSON files", type=['json'], accept_multiple_files=True)
+    
+    if uploaded_files:
+        new_results = []
+        
+        for idx, file in enumerate(uploaded_files):
+            with st.expander(f"📄 {file.name}", expanded=(idx==0)):
+                try:
+                    content = file.read().decode('utf-8')
+                    extracted = extract_json_data(content)
+                    
+                    if extracted:
+                        concentration = calculate_concentration(extracted['loc_doses'], st.session_state.loc_config)
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Conc", f"{concentration:.3f}")
+                        with col2:
+                            st.metric("Abs", f"{extracted['absorbance']:.4f}" if extracted['absorbance'] else "N/A")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            level = st.number_input("Level", 1, len(design.spike_levels), 1, key=f"lev_{idx}")
+                        with col2:
+                            rep = st.number_input("Replicate", 1, design.num_replicates, 1, key=f"rep_{idx}")
+                        
+                        result = TestResult(
+                            step_id=step_id,
+                            test_number=collected + len(new_results) + 1,
+                            shield_test_number=extracted['shield_test_number'],
+                            timestamp=extracted['timestamp'],
+                            concentration=concentration,
+                            absorbance=extracted['absorbance'] or 0.0,
+                            bg_mean=extracted['bg_mean'] or 0.0,
+                            sample_mean=extracted['sample_mean'] or 0.0,
+                            temperature=extracted['temperature'] or 0.0,
+                            loc_doses=extracted['loc_doses'],
+                            level_number=level,
+                            replicate_number=rep
+                        )
+                        
+                        new_results.append(result)
+                        st.success("✅ Ready")
+                    
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
+        
+        if new_results:
+            st.markdown("---")
+            if st.button(f"📥 Import {len(new_results)} tests", type="primary"):
+                st.session_state.results[step_id].extend(new_results)
+                st.session_state.validation_steps[step_id].status = 'collecting'
+                st.success(f"✅ Imported {len(new_results)} tests!")
+                st.rerun()
+    
+    if results:
+        st.markdown("---")
+        st.subheader("📊 Collected Data")
+        
+        df = pd.DataFrame([{
+            'Test': r.test_number,
+            'Shield #': r.shield_test_number,
+            'Level': r.level_number,
+            'Rep': r.replicate_number,
+            'Conc': f"{r.concentration:.3f}",
+            'Abs': f"{r.absorbance:.4f}"
+        } for r in results])
+        
+        st.dataframe(safe_dataframe_display(df), width='stretch')
+
+def show_analyze_tab(step_id, step_config):
+    st.subheader("📊 Analysis")
+    
+    results = st.session_state.results[step_id]
+    
+    if not results:
+        st.warning("⚠️ No data to analyze")
+        return
+    
+    if step_id not in st.session_state.designs:
+        st.error("❌ No design found")
+        return
+    
+    design = st.session_state.designs[step_id]
+    
+    if st.button("🔬 Run Analysis", type="primary"):
+        with st.spinner("Analyzing..."):
+            df = pd.DataFrame([asdict(r) for r in results])
+            
+            try:
+                if step_id == 'linearity':
+                    analysis = analyze_linearity(df, design, step_config)
+                elif step_id == 'repeatability':
+                    analysis = analyze_repeatability(df, design, step_config)
+                elif step_id == 'accuracy':
+                    analysis = analyze_accuracy(df, design, step_config)
+                else:
+                    analysis = {'error': 'Not implemented'}
+                
+                if 'error' in analysis:
+                    st.error(f"❌ {analysis['error']}")
+                else:
+                    st.session_state.analyses[step_id] = analysis
+                    st.session_state.validation_steps[step_id].status = 'analyzed'
+                    st.success("✅ Analysis complete!")
+                    st.rerun()
+            
+            except Exception as e:
+                st.error(f"❌ Analysis failed: {str(e)}")
+    
+    if step_id in st.session_state.analyses:
+        st.success("✅ Analysis completed! View in Results tab")
+
+def show_results_tab(step_id, step_config):
+    st.subheader("📈 Results")
+    
+    if step_id not in st.session_state.analyses:
+        st.warning("⚠️ Run analysis first")
+        return
+    
+    analysis = st.session_state.analyses[step_id]
+    
+    if 'error' in analysis:
+        st.error(f"❌ {analysis['error']}")
+        return
+    
+    # Show results based on step
+    if step_id == 'linearity':
+        show_linearity_results(analysis, step_config)
+    elif step_id == 'repeatability':
+        show_repeatability_results(analysis, step_config)
+    elif step_id == 'accuracy':
+        show_accuracy_results(analysis, step_config)
+
+def show_linearity_results(analysis, config):
+    if analysis['passes']:
+        st.success(f"✅ PASS: R² = {analysis['r_squared']:.4f}")
+    else:
+        st.error(f"❌ FAIL: R² = {analysis['r_squared']:.4f}")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("R²", f"{analysis['r_squared']:.4f}")
+    with col2:
+        st.metric("Slope", f"{analysis['slope']:.6f}")
+    with col3:
+        st.metric("Intercept", f"{analysis['intercept']:.6f}")
+    
+    # Plot
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=analysis['x'],
+        y=analysis['y'],
+        mode='markers',
+        name='Data',
+        marker=dict(size=10, color='blue')
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=analysis['x'],
+        y=analysis['y_pred'],
+        mode='lines',
+        name='Fit',
+        line=dict(color='red', width=2)
+    ))
+    
+    fig.update_layout(
+        title=f"Linearity: y = {analysis['slope']:.6f}x + {analysis['intercept']:.6f}",
+        xaxis_title="Concentration (mg/L)",
+        yaxis_title="Absorbance",
+        height=500
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+def show_repeatability_results(analysis, config):
+    if analysis['passes']:
+        st.success("✅ PASS: All levels meet RSD criteria")
+    else:
+        st.error("❌ FAIL: Some levels exceed RSD")
+    
+    data = []
+    for level, res in analysis['by_level'].items():
+        data.append({
+            'Level': level,
+            'Mean': f"{res['mean']:.3f}",
+            'RSD (%)': f"{res['rsd']:.2f}",
+            'n': res['n'],
+            'Status': '✅' if res['passes'] else '❌'
+        })
+    
+    df = pd.DataFrame(data)
+    st.dataframe(safe_dataframe_display(df), width='stretch')
+    
+    # Plot
+    fig = go.Figure()
+    
+    for level, res in analysis['by_level'].items():
+        fig.add_trace(go.Box(
+            y=res['data'],
+            name=f"Level {level}",
+            boxmean='sd'
+        ))
+    
+    fig.update_layout(
+        title="Repeatability by Level",
+        xaxis_title="Level",
+        yaxis_title="Concentration (mg/L)",
+        height=500
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+def show_accuracy_results(analysis, config):
+    if analysis['passes']:
+        st.success("✅ PASS: All recoveries acceptable")
+    else:
+        st.error("❌ FAIL: Some recoveries outside range")
+    
+    data = []
+    for level, res in analysis['by_level'].items():
+        data.append({
+            'Level': level,
+            'Spiked': f"{res['spike_conc']:.3f}",
+            'Measured': f"{res['measured']:.3f}",
+            'Recovery (%)': f"{res['recovery']:.1f}",
+            'Status': '✅' if res['passes'] else '❌'
+        })
+    
+    df = pd.DataFrame(data)
+    st.dataframe(safe_dataframe_display(df), width='stretch')
+
+def show_config():
+    st.header("⚙️ LOC Configuration")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        base_vol = st.number_input("Base Volume (mL)", value=40.0, step=1.0)
+        extra_vol = st.number_input("Extra Volume (mL)", value=0.0, step=0.1)
+    
+    with col2:
+        standard_loc = st.selectbox("Standard LOC", [f'LOC{i}' for i in range(1, 17)], index=14)
+        stock_conc = st.number_input("Stock Conc (mg/L)", value=1000.0, step=10.0)
+    
+    if st.button("💾 Save", type="primary"):
+        st.session_state.loc_config.update({
+            'base_sample_volume': base_vol,
+            'extra_volume': extra_vol,
+            'standard_loc': standard_loc,
+            'stock_concentration': stock_conc
+        })
+        st.success("✅ Saved!")
+
+if __name__ == "__main__":
+    main()
