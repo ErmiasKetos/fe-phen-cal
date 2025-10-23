@@ -1,741 +1,554 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+
 import streamlit as st
-import json
-import math
-import statistics as stats
-from datetime import datetime
 import pandas as pd
 import numpy as np
-import io
+import json, io, zipfile, datetime as dt
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Fe Phenanthroline — Method Development & Analysis", layout="wide")
+st.set_page_config(
+    page_title="Fe²⁺/Fe³⁺ Method Validation",
+    page_icon="🧪",
+    layout="wide",
+)
 
-# =========================
-# Utility functions
-# =========================
+# -----------------------------
+# Utility
+# -----------------------------
+
+def robust_mean(values):
+    vals = np.array(values, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return None
+    med = np.median(vals)
+    mad = np.median(np.abs(vals - med))
+    if mad == 0:
+        return float(np.mean(vals))
+    thr = 3 * 1.4826 * mad
+    keep = np.abs(vals - med) <= thr
+    kept = vals[keep]
+    if kept.size == 0:
+        kept = vals
+    return float(np.mean(kept))
 
 def parse_values(raw):
-    """
-    Accepts either a list of numbers, a comma-separated string of numbers,
-    or a list of dicts with 'value'/'intensity'. Returns list[float].
-    """
     if raw is None:
         return []
     if isinstance(raw, list):
         out = []
-        for item in raw:
-            try:
-                out.append(float(item))
-            except Exception:
-                if isinstance(item, dict):
-                    if "value" in item:
-                        out.append(float(item["value"]))
-                    elif "intensity" in item:
-                        out.append(float(item["intensity"]))
-        return out
+        for v in raw:
+            if isinstance(v, (int, float)):
+                out.append(float(v))
+            elif isinstance(v, str):
+                try:
+                    out.append(float(v))
+                except:
+                    pass
+            elif isinstance(v, dict):
+                for k in ("value","intensity"):
+                    if k in v:
+                        try:
+                            out.append(float(v[k]))
+                        except:
+                            pass
+        return [x for x in out if np.isfinite(x)]
     if isinstance(raw, str):
-        s = raw.strip()
-        if s.startswith("[") and s.endswith("]"):
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        out = []
+        for p in parts:
             try:
-                arr = json.loads(s)
-                return [float(x) for x in arr]
-            except Exception:
+                out.append(float(p))
+            except:
                 pass
-        parts = [p.strip() for p in s.split(",") if p.strip() != ""]
-        try:
-            return [float(p) for p in parts]
-        except Exception:
-            return []
+        return [x for x in out if np.isfinite(x)]
     return []
 
-def robust_mean(values):
-    """
-    Median/MAD outlier filter (3*MAD). Returns (mean_of_kept, kept_values).
-    """
-    vals = [float(v) for v in values if v is not None]
-    if len(vals) == 0:
-        return float("nan"), []
-    med = stats.median(vals)
-    mad = stats.median([abs(x - med) for x in vals])
-    if mad == 0:
-        return sum(vals)/len(vals), vals
-    thr = 3.0 * 1.4826 * mad
-    kept = [x for x in vals if abs(x - med) <= thr]
-    if not kept:
-        kept = vals
-    return sum(kept)/len(kept), kept
-
-def _find_scans(obj):
-    """
-    Recursively search the JSON object for a key named 'scans' that holds a list.
-    Returns the first such list found or None.
-    """
+def find_scans(obj):
+    # recursively find 'scans'
     if isinstance(obj, dict):
-        for k, v in obj.items():
-            if k == "scans" and isinstance(v, list):
-                return v
-            found = _find_scans(v)
-            if found is not None:
-                return found
+        if "scans" in obj and isinstance(obj["scans"], list):
+            return obj["scans"]
+        for v in obj.values():
+            res = find_scans(v)
+            if res is not None:
+                return res
     elif isinstance(obj, list):
-        for item in obj:
-            found = _find_scans(item)
-            if found is not None:
-                return found
+        for it in obj:
+            res = find_scans(it)
+            if res is not None:
+                return res
     return None
 
-def _get_channel_array(node, led_key):
-    """
-    Extract the array for the given LED from a scan node.
-    Accepts direct key, case-insensitive key, or nested under 'channels'/'Channels'/'data'.
-    """
-    if led_key in node:
-        return parse_values(node.get(led_key))
-    for k in list(node.keys()):
-        if isinstance(k, str) and k.lower() == led_key.lower():
-            return parse_values(node.get(k))
-    for key in ["channels", "Channels", "data", "Data"]:
-        if isinstance(node.get(key), dict):
-            m = node[key]
-            if led_key in m:
-                return parse_values(m[led_key])
-            for mk in m.keys():
-                if isinstance(mk, str) and mk.lower() == led_key.lower():
-                    return parse_values(m[mk])
+def get_scan_type(scan):
+    stype = (
+        scan.get("scanType")
+        or (scan.get("parameters") or {}).get("scanType")
+        or (scan.get("parameters") or {}).get("scan_type")
+        or ""
+    )
+    stype = str(stype).lower()
+    if "back" in stype or "bg" in stype:
+        return "background"
+    if "sam" in stype:
+        return "sample"
+    return ""
+
+def get_channel_array(scan, channel_key):
+    if not isinstance(scan, dict):
+        return []
+    # direct hit
+    if channel_key in scan:
+        return parse_values(scan[channel_key])
+    # case-insensitive
+    for k in scan.keys():
+        if str(k).lower() == str(channel_key).lower():
+            return parse_values(scan[k])
+    # nested common
+    nested = scan.get("channels") or scan.get("Channels") or scan.get("data") or scan.get("Data")
+    if isinstance(nested, dict):
+        if channel_key in nested:
+            return parse_values(nested[channel_key])
+        for k in nested.keys():
+            if str(k).lower() == str(channel_key).lower():
+                return parse_values(nested[k])
     return []
 
-def extract_bg_sample(json_obj, led_key="SC_Green"):
-    """
-    Find Background and Sample arrays for the chosen LED inside a single run JSON.
-    Looks for entries where scanType ~ 'Background' or 'Sample' (case-insensitive),
-    either in node['parameters']['scanType'] or node['scanType'].
-    """
-    scans = _find_scans(json_obj) or []
-    bg_list, sm_list = [], []
-    for node in scans:
-        if not isinstance(node, dict):
-            continue
-        params = node.get("parameters") or {}
-        stype = params.get("scanType") or node.get("scanType") or ""
-        ch_vals = _get_channel_array(node, led_key)
-        if not ch_vals:
-            continue
-        s_low = str(stype).lower()
-        if s_low.startswith("back"):
-            bg_list = ch_vals
-        elif s_low.startswith("sam"):
-            sm_list = ch_vals
-    return bg_list, sm_list
-
-def extract_sample_node(json_obj):
-    """Return the first node in scans that is a Sample."""
-    scans = _find_scans(json_obj) or []
-    for node in scans:
-        if not isinstance(node, dict):
-            continue
-        params = node.get("parameters") or {}
-        stype = params.get("scanType") or node.get("scanType") or ""
-        if str(stype).lower().startswith("sam"):
-            return node
-    return None
-
-def get_loc_doses_from_sample(json_obj):
-    """
-    From the Sample scan node, extract LOC dosing volumes in µL.
-    Accepts keys like 'LOC1', 'LOC2', ... with numeric values.
-    Returns dict: {'LOC1': 200, 'LOC3': 2000, ...} for nonzero entries.
-    """
-    node = extract_sample_node(json_obj)
+def extract_loc_doses(scan):
     doses = {}
-    if node is None:
+    if not isinstance(scan, dict):
         return doses
-    # Search in node and nested 'parameters' for LOC fields
-    candidates = [node, node.get("parameters", {})]
-    for src in candidates:
+    for src in (scan, scan.get("parameters", {})):
         if isinstance(src, dict):
             for k, v in src.items():
                 if isinstance(k, str) and k.upper().startswith("LOC"):
                     try:
                         val = float(v)
-                        if abs(val) > 0:
-                            doses[k] = val
-                    except Exception:
-                        continue
+                        if val > 0:
+                            doses[k.upper()] = val
+                    except:
+                        pass
     return doses
 
-def compute_spike_concentration_mgL(stock_mgL, spike_uL, base_sample_mL=40.0, extra_reagent_mL=0.0):
-    """
-    Compute final concentration after spiking:
-    C_final = C_stock * V_spike / V_total
-    where V_spike is in mL (spike_uL/1000), and V_total = base_sample_mL + extra_reagent_mL.
-    Caller can add total LOC volume to extra_reagent_mL if desired.
-    """
-    V_spike_mL = spike_uL / 1000.0
-    V_total_mL = base_sample_mL + extra_reagent_mL
-    if V_total_mL <= 0:
-        return float("nan")
-    return stock_mgL * (V_spike_mL / V_total_mL)
+def compute_absorbance(bg_vals, smp_vals):
+    bgm = robust_mean(bg_vals)
+    sm = robust_mean(smp_vals)
+    if bgm is None or sm is None or sm <= 0:
+        return None, bgm, sm
+    A = np.log10(bgm / sm)
+    return float(A), float(bgm), float(sm)
 
-def compute_absorbance_from_json_bytes(file_bytes, led_key="SC_Green"):
-    """
-    Compute absorbance A from a single device JSON file:
-    A = log10(mean(Background) / mean(Sample))
-    using robust means (MAD filter).
-    """
-    try:
-        obj = json.loads(file_bytes.decode("utf-8"))
-    except Exception:
-        obj = json.loads(file_bytes)
-    bg_vals, sm_vals = extract_bg_sample(obj, led_key=led_key)
-    if not bg_vals or not sm_vals:
-        raise ValueError("Could not find both Background and Sample arrays for the selected LED in the JSON.")
-    bg_avg, bg_kept = robust_mean(bg_vals)
-    sm_avg, sm_kept = robust_mean(sm_vals)
-    if bg_avg <= 0 or sm_avg <= 0:
-        raise ValueError("Non-positive intensity after averaging.")
-    A = math.log10(bg_avg / sm_avg)
-    diag = {
-        "bg_avg": bg_avg, "sm_avg": sm_avg,
-        "bg_kept_n": len(bg_kept), "sm_kept_n": len(sm_kept),
-        "bg_raw_n": len(bg_vals), "sm_raw_n": len(sm_vals),
+# -----------------------------
+# Session state initialization
+# -----------------------------
+
+DEFAULT_SHEETS = [
+    "4A_Linearity_Phase1",
+    "4A_Linearity_Phase2",
+    "4B_Interference",
+    "5A_Repeatability",
+    "5A_Intermediate_Precision",
+    "5B_Accuracy",
+    "5C_LOD_LOQ",
+    "5D_Stability",
+    "6_Robustness",
+    "7_Sample_Matrix",
+]
+
+if "loc_config" not in st.session_state:
+    # LOC1..LOC16 table
+    rows = []
+    for i in range(1,17):
+        rows.append({
+            "LOC": f"LOC{i}",
+            "Reagent Role": "Not Used" if i!=15 else "Fe Standard",
+            "Stock Conc (mg/L)": 1000.0 if i==15 else "",
+            "Is Standard?": True if i==15 else False,
+            "Description": "Fe²⁺ stock 1000 mg/L" if i==15 else "",
+            "Notes": "",
+        })
+    st.session_state.loc_config = pd.DataFrame(rows)
+if "vol_config" not in st.session_state:
+    st.session_state.vol_config = {
+        "Base Sample Volume (mL)": 40.0,
+        "Extra Constant Volume (mL)": 0.0,
+        "Include LOC Volumes?": True,
+        "LED Channel": "SC_Green",
     }
-    return A, diag, obj  # return parsed obj for LOC use
+if "raw_log" not in st.session_state:
+    st.session_state.raw_log = pd.DataFrame(columns=[
+        "Import Time","Shield Test #","File Name","Calculated Conc (mg/L)","LOC Doses (µL)",
+        "Absorbance","BG Mean","Sample Mean","Temperature (°C)","LED Channel","Import Status","Target Sheet","Row Inserted","Notes"
+    ])
+if "sheets" not in st.session_state:
+    st.session_state.sheets = {name: pd.DataFrame() for name in DEFAULT_SHEETS}
 
-def fit_linear(xs, ys, weights=None):
-    """Weighted (or unweighted) linear regression. Returns (slope, intercept, R2)."""
-    xs = np.asarray(xs, dtype=float)
-    ys = np.asarray(ys, dtype=float)
-    if weights is None:
-        w = np.ones_like(xs, dtype=float)
-    else:
-        w = np.asarray(weights, dtype=float)
-        if w.shape != xs.shape:
-            w = np.ones_like(xs, dtype=float)
-    W = np.sum(w)
-    xw = np.sum(w * xs) / W
-    yw = np.sum(w * ys) / W
-    num = np.sum(w * (xs - xw) * (ys - yw))
-    den = np.sum(w * (xs - xw) ** 2)
-    if den == 0:
-        raise ValueError("Zero variance in x.")
-    m = num / den
-    b = yw - m * xw
-    ss_tot = np.sum(w * (ys - yw) ** 2)
-    ss_res = np.sum(w * (ys - (m * xs + b)) ** 2)
-    R2 = 1.0 - (ss_res / ss_tot if ss_tot > 0 else 0.0)
-    return float(m), float(b), float(R2)
-
-def lod_loq(blank_As, slope):
-    """Compute LoD and LoQ from blank SD and slope."""
-    if slope == 0 or not blank_As:
-        return float("nan"), float("nan"), 0.0
-    sd = float(np.std(blank_As, ddof=0))
-    return 3.3 * sd / abs(slope), 10.0 * sd / abs(slope), sd
-
-def predict_conc(A, slope, intercept):
-    return (A - intercept) / slope
-
-def make_plot(xs, ys, m, b, title, xlabel="Concentration (mg/L)", ylabel="Absorbance (A)"):
-    """Create a simple scatter + fitted line plot, return PNG and PDF bytes."""
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.scatter(xs, ys)
-    x_min, x_max = min(xs), max(xs)
-    span = x_max - x_min
-    grid_x = np.linspace(x_min - 0.05*span, x_max + 0.05*span if span > 0 else x_max + 1, 100)
-    ax.plot(grid_x, m*grid_x + b)
-    ax.set_title(title)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    fig.tight_layout()
-
-    png_buf = io.BytesIO()
-    fig.savefig(png_buf, format="png", dpi=200, bbox_inches="tight")
-    png_buf.seek(0)
-
-    pdf_buf = io.BytesIO()
-    fig.savefig(pdf_buf, format="pdf", bbox_inches="tight")
-    pdf_buf.seek(0)
-
-    plt.close(fig)
-    return png_buf.getvalue(), pdf_buf.getvalue()
-
-# =========================
-# LOC Profile (persistent mapping)
-# =========================
-
-DEFAULT_PROFILE = {
-    "defaults": {
-        "base_sample_mL": 40.0,
-        "extra_constant_mL": 0.0,
-        "include_all_loc_volumes": True
-    },
-    # "locs": {"LOC1": {"role":"standard","stock_mgL":1000.0,"notes":"Fe2 standard"}, ...}
-    "locs": {}
-}
-
-def get_profile():
-    if "loc_profile" not in st.session_state:
-        st.session_state["loc_profile"] = json.loads(json.dumps(DEFAULT_PROFILE))
-    return st.session_state["loc_profile"]
-
-def set_profile(p):
-    if "defaults" not in p:
-        p["defaults"] = DEFAULT_PROFILE["defaults"].copy()
-    if "locs" not in p:
-        p["locs"] = {}
-    st.session_state["loc_profile"] = p
-
-def profile_pick_standard(detected_locs: dict):
-    """
-    Given detected LOC doses from a file, use the profile to decide which LOC is standard.
-    Returns (std_loc, stock_mgL) or (None, None) if not determinable.
-    """
-    prof = get_profile()
-    loc_map = prof.get("locs", {})
-    candidates = [k for k in detected_locs.keys() if loc_map.get(k, {}).get("role") == "standard"]
-    if not candidates:
-        return None, None
-    candidates.sort(key=lambda k: float(detected_locs.get(k, 0.0)), reverse=True)
-    chosen = candidates[0]
-    stock = float(loc_map.get(chosen, {}).get("stock_mgL", 0.0) or 0.0)
-    if stock <= 0:
-        return chosen, None
-    return chosen, stock
-
-# =========================
-# UI
-# =========================
-
-st.title("Fe Phenanthroline — Method Development & Analysis")
-
-with st.sidebar:
-    st.header("Configuration")
-    led_key = st.selectbox("LED channel", ["SC_Green","SC_Blue2","SC_Orange","SC_Red"], index=0)
-    weighting_scheme = st.selectbox(
-        "Weighting scheme",
-        ["None (OLS)", "1/max(C,1)", "Variance-weighted (1/SD^2)"],
-        index=2
-    )
-    use_rep_means = st.checkbox("Fit using replicate means", value=True)
-    expected_reps = st.number_input("Expected replicates per level", min_value=1, max_value=10, value=2, step=1)
-    st.caption("Replicates are used to average A at each level and compute SD/RSD.")
-
-    with st.expander("LOC Profile (persistent)", expanded=False):
-        prof = get_profile()
-
-        # Defaults
-        st.markdown("**Defaults**")
-        prof["defaults"]["base_sample_mL"] = st.number_input(
-            "Base sample volume (mL) — default", min_value=1.0, max_value=500.0,
-            value=float(prof["defaults"].get("base_sample_mL", 40.0)), step=0.5
-        )
-        prof["defaults"]["extra_constant_mL"] = st.number_input(
-            "Extra constant reagent volume per run (mL) — default", min_value=0.0, max_value=50.0,
-            value=float(prof["defaults"].get("extra_constant_mL", 0.0)), step=0.1
-        )
-        prof["defaults"]["include_all_loc_volumes"] = st.checkbox(
-            "Include ALL LOC volumes in final volume by default",
-            value=bool(prof["defaults"].get("include_all_loc_volumes", True))
-        )
-
-        st.markdown("---")
-        st.markdown("**LOC mappings**")
-        for i in range(1, 17):
-            key = f"LOC{i}"
-            row = prof["locs"].get(key, {})
-            cols = st.columns([1, 1, 1, 2])
-            with cols[0]:
-                options = ["", "standard", "reducer", "buffer", "other"]
-                idx = options.index(row.get("role","")) if row.get("role","") in options else 0
-                role = st.selectbox(f"{key} role", options, index=idx, key=f"role_{key}")
-            with cols[1]:
-                stock = st.number_input(f"{key} stock (mg/L)", min_value=0.0, max_value=1_000_000.0,
-                                        value=float(row.get("stock_mgL", 0.0) or 0.0), step=10.0, key=f"stock_{key}")
-            with cols[2]:
-                note = st.text_input(f"{key} notes", value=row.get("notes",""), key=f"note_{key}")
-            if role or stock > 0 or note:
-                prof["locs"][key] = {"role": role or "", "stock_mgL": stock, "notes": note}
-            else:
-                if key in prof["locs"]:
-                    del prof["locs"][key]
-
-        st.markdown("---")
-        colp1, colp2 = st.columns(2)
-        with colp1:
-            st.download_button("Download profile JSON", data=json.dumps(prof, indent=2),
-                               file_name="loc_profile.json", mime="application/json")
-        with colp2:
-            up = st.file_uploader("Load profile JSON", type=["json"], key="loc_profile_upload")
-            if up:
-                try:
-                    p = json.loads(up.getvalue().decode("utf-8"))
-                    set_profile(p)
-                    st.success("Profile loaded.")
-                except Exception as e:
-                    st.error(f"Failed to load profile: {e}")
-
-tabs = st.tabs(["Calibration Builder", "Unknown Prediction", "DOE Plan", "JSON Explorer", "About"])
-
-# ---------- Calibration Builder ----------
-with tabs[0]:
-    st.subheader("Upload calibration runs")
-    st.write("Upload JSON files for **Fe²⁺** (no reducer) and **Total-Fe** (with reducer). Include several **0 mg/L blanks**.")
-    uploaded_files = st.file_uploader("Drop multiple JSON files", type=["json"], accept_multiple_files=True)
-
-    # Per-file concentration & channel prompt (with LOC-based inference)
-    file_rows = []
-    if uploaded_files:
-        st.markdown("### Assign channel & concentration to each file")
-        for f in uploaded_files:
-            with st.expander(f"File: {f.name}", expanded=True):
-                # Parse JSON
-                try:
-                    obj = json.loads(f.getvalue().decode("utf-8"))
-                except Exception:
-                    obj = json.loads(f.getvalue())
-
-                # Extract LOC doses and try profile auto-pick
-                loc_doses = get_loc_doses_from_sample(obj)
-                prof = get_profile()
-                auto_std_loc, auto_stock = profile_pick_standard(loc_doses) if loc_doses else (None, None)
-
-                if loc_doses:
-                    st.write("Detected LOC doses (µL):", loc_doses)
-                    keys = list(loc_doses.keys())
-                    options = ["(no standard)"] + keys
-                    default_idx = 0
-                    if auto_std_loc in keys:
-                        default_idx = 1 + keys.index(auto_std_loc)
-                        st.success(f"Profile suggests standard at **{auto_std_loc}**")
-                    std_loc = st.selectbox(
-                        f"Which LOC is the STANDARD in {f.name}?",
-                        options, index=default_idx, key=f"stdloc_{f.name}"
-                    )
-
-                    # Volume defaults from profile
-                    base_vol = st.number_input(
-                        "Base sample volume (mL)",
-                        min_value=1.0, max_value=200.0,
-                        value=float(prof['defaults'].get('base_sample_mL', 40.0)),
-                        step=0.5, key=f"base_{f.name}"
-                    )
-                    extra_const = st.number_input(
-                        "Extra constant reagent volume per run (mL)",
-                        min_value=0.0, max_value=20.0,
-                        value=float(prof['defaults'].get('extra_constant_mL', 0.0)),
-                        step=0.1, key=f"extra_{f.name}"
-                    )
-                    include_all_locs = st.checkbox(
-                        "Include ALL LOC volumes in final volume (recommended)",
-                        value=bool(prof['defaults'].get('include_all_loc_volumes', True)),
-                        key=f"inclall_{f.name}"
-                    )
-                    total_loc_mL = sum(loc_doses.values())/1000.0 if include_all_locs else 0.0
-
-                    if std_loc == "(no standard)":
-                        conc_calc = 0.0
-                        st.info("No standard spike selected → assigned **0.0000 mg/L** (blank).")
-                    else:
-                        # Stock concentration: prefill from profile if available
-                        default_stock = None
-                        if auto_std_loc and auto_std_loc == std_loc and auto_stock:
-                            default_stock = float(auto_stock)
-                        elif prof['locs'].get(std_loc, {}).get('stock_mgL', 0.0):
-                            default_stock = float(prof['locs'][std_loc]['stock_mgL'])
-                        stock_conc = st.number_input(
-                            f"Stock concentration (mg/L) at {std_loc}",
-                            min_value=0.0, max_value=1_000_000.0, value=(default_stock if default_stock is not None else 1000.0),
-                            step=10.0, key=f"stock_{f.name}"
-                        )
-                        spike_uL = float(loc_doses.get(std_loc, 0.0))
-                        conc_calc = compute_spike_concentration_mgL(
-                            stock_conc, spike_uL,
-                            base_sample_mL=base_vol,
-                            extra_reagent_mL=extra_const + total_loc_mL
-                        )
-                        st.info(f"Calculated nominal concentration from {std_loc}: **{conc_calc:.4f} mg/L**")
-
-                    use_auto = st.checkbox("Use this calculated concentration", value=True, key=f"useauto_{f.name}")
-                else:
-                    st.warning("No LOC doses detected in the Sample scan → assigned **0.0000 mg/L** (blank).")
-                    conc_calc = 0.0
-                    use_auto = True  # 0 by default
-
-                ch = st.selectbox(f"Channel for {f.name}", ["Fe2", "TotalFe"], key=f"ch_{f.name}")
-                manual_conc = st.number_input(
-                    f"Manual concentration (mg/L) for {f.name} (overrides if provided)",
-                    min_value=0.0, max_value=1000000.0, value=0.0, step=0.1, key=f"conc_{f.name}"
-                )
-                final_conc = manual_conc if manual_conc > 0 else (conc_calc if use_auto else 0.0)
-                st.caption(f"Final concentration used for this file: {final_conc:.4f} mg/L")
-
-                # Compute absorbance
-                try:
-                    A, diag, _ = compute_absorbance_from_json_bytes(f.getvalue(), led_key=led_key)
-                    st.code(f"A = {A:.6f} | BG mean = {diag['bg_avg']:.2f}, Sample mean = {diag['sm_avg']:.2f} | N(BG)={diag['bg_kept_n']}/{diag['bg_raw_n']}, N(S)={diag['sm_kept_n']}/{diag['sm_raw_n']}")
-                except Exception as e:
-                    st.error(f"Absorbance calc failed: {e}")
-                    A = None
-
-                file_rows.append({"file_name": f.name, "channel": ch, "concentration_mgL": final_conc, "A": A})
-
-        if st.button("Add all to calibration table"):
-            cal_results = pd.DataFrame(file_rows)
-            st.session_state["cal_results"] = cal_results
-
-    # Show absorbances and summaries
-    if "cal_results" in st.session_state:
-        cal_df = st.session_state["cal_results"]
-        st.markdown("### Calibration table")
-        st.dataframe(cal_df)
-
-        # Replicate aggregation
-        def aggregate(df_in, channel_name):
-            sub = df_in[df_in["channel"].str.lower() == channel_name.lower()].copy()
-            sub["concentration_mgL"] = pd.to_numeric(sub["concentration_mgL"], errors="coerce")
-            sub = sub.dropna(subset=["concentration_mgL", "A"])
-            if sub.empty:
-                return None, None
-            grp = sub.groupby("concentration_mgL", as_index=False).agg(
-                n=("A", "count"),
-                A_mean=("A", "mean"),
-                A_sd=("A", "std")
-            )
-            grp["A_sd"].fillna(0.0, inplace=True)
-            grp["A_rsd_%"] = np.where(grp["A_mean"] != 0, grp["A_sd"] / grp["A_mean"] * 100.0, np.nan)
-            grp["meets_n"] = grp["n"] >= expected_reps
-            grp["flag"] = np.where(grp["meets_n"], "", f"Need ≥{expected_reps}")
-            return sub, grp
-
-        st.markdown("### Replicate summary by level")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Fe²⁺**")
-            subA, grpA = aggregate(cal_df, "Fe2")
-            if grpA is not None:
-                st.dataframe(grpA)
-        with c2:
-            st.markdown("**Total-Fe**")
-            subB, grpB = aggregate(cal_df, "TotalFe")
-            if grpB is not None:
-                st.dataframe(grpB)
-
-        # Fitting helper
-        def fit_channel(sub_df, grp_df, title):
-            """Fit channel with sanity checks. Returns fit results and plot bytes or None."""
-            if sub_df is None and grp_df is None:
-                return None, None, None
-
-            # Build x/y from replicate means or raw, plus blanks for LoD/LoQ
-            use_means = use_rep_means and (grp_df is not None) and (not grp_df.empty)
-            if use_means:
-                xs = grp_df["concentration_mgL"].astype(float).values.tolist()
-                ys = grp_df["A_mean"].astype(float).values.tolist()
-                sds = grp_df["A_sd"].astype(float).values.tolist()
-                blanks = grp_df[grp_df["concentration_mgL"] == 0]["A_mean"].astype(float).values.tolist()
-            else:
-                if sub_df is None or sub_df.empty:
-                    return None, None, None
-                xs = sub_df["concentration_mgL"].astype(float).values.tolist()
-                ys = sub_df["A"].astype(float).values.tolist()
-                sds = None  # not available at raw level
-                blanks = sub_df[sub_df["concentration_mgL"] == 0]["A"].astype(float).values.tolist()
-
-            # Drop NaNs/Infs
-            xy = [(x, y, sds[i] if sds is not None and i < len(sds) else None) for i, (x, y) in enumerate(zip(xs, ys)) if np.isfinite(x) and np.isfinite(y)]
-            if len(xy) < 2:
-                st.warning(f"{title}: Need at least 2 valid data points to fit a line.")
-                return None, None, None
-
-            xs = [x for x, _, _ in xy]
-            ys = [y for _, y, _ in xy]
-            sds = [sd for _, _, sd in xy] if use_means else None
-
-            # Require at least 2 unique levels
-            if len(set(round(x, 6) for x in xs)) < 2:
-                st.warning(f"{title}: All concentrations are the same. Add at least one more level.")
-                return None, None, None
-
-            # Build weights
-            weights = None
-            if weighting_scheme == "1/max(C,1)":
-                weights = [1.0 / max(x, 1.0) for x in xs]
-            elif weighting_scheme == "Variance-weighted (1/SD^2)" and use_means:
-                eps = 1e-6
-                nz = [sd for sd in sds if sd and sd > 0]
-                base = np.median(nz) if nz else 0.01
-                denom = [(sd if (sd and sd > 0) else base) ** 2 + eps for sd in sds]
-                weights = [1.0 / d for d in denom]
-            # else: OLS
-
-            try:
-                m, b, R2 = fit_linear(xs, ys, weights=weights)
-            except Exception as e:
-                st.error(f"{title}: Could not fit model: {e}")
-                return None, None, None
-
-            lod, loq, sd_blank = lod_loq(blanks, m)
-
-            # Build plot
-            try:
-                png_bytes, pdf_bytes = make_plot(xs, ys, m, b, title=title)
-            except Exception:
-                png_bytes, pdf_bytes = None, None
-
-            res = {
-                "m": m, "b": b, "R2": R2,
-                "LoD": lod, "LoQ": loq,
-                "blank_sd_A": sd_blank,
-                "n_points": len(xs),
-                "levels": sorted(set(xs)),
-                "weighting": weighting_scheme,
-                "used_replicate_means": use_means,
-            }
-            return res, png_bytes, pdf_bytes
-
-        st.markdown("### Model Fits")
-        resA, pngA, pdfA = fit_channel(subA, grpA, "Fe²⁺ calibration")
-        resB, pngB, pdfB = fit_channel(subB, grpB, "Total-Fe calibration")
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            st.markdown("**Fe²⁺ model**")
-            if resA:
-                st.json(resA, expanded=False)
-                if pngA:
-                    st.download_button("Download Fe²⁺ plot (PNG)", data=pngA, file_name="Fe2_calibration.png", mime="image/png")
-                    st.download_button("Download Fe²⁺ plot (PDF)", data=pdfA, file_name="Fe2_calibration.pdf", mime="application/pdf")
-            else:
-                st.info("Add Fe²⁺ rows with valid A and concentrations (≥2 distinct levels).")
-        with cc2:
-            st.markdown("**Total-Fe model**")
-            if resB:
-                st.json(resB, expanded=False)
-                if pngB:
-                    st.download_button("Download Total-Fe plot (PNG)", data=pngB, file_name="TotalFe_calibration.png", mime="image/png")
-                    st.download_button("Download Total-Fe plot (PDF)", data=pdfB, file_name="TotalFe_calibration.pdf", mime="application/pdf")
-            else:
-                st.info("Add Total-Fe rows with valid A and concentrations (≥2 distinct levels).")
-
-        if resA and resB:
-            model = {
-                "created_at": datetime.utcnow().isoformat() + "Z",
-                "led": led_key,
-                "slope": {"Fe2": resA["m"], "TotalFe": resB["m"]},
-                "intercept": {"Fe2": resA["b"], "TotalFe": resB["b"]},
-                "R2": {"Fe2": resA["R2"], "TotalFe": resB["R2"]},
-                "LoD": {"Fe2": resA["LoD"], "TotalFe": resB["LoD"]},
-                "LoQ": {"Fe2": resA["LoQ"], "TotalFe": resB["LoQ"]},
-                "blank_sd_A": {"Fe2": resA["blank_sd_A"], "TotalFe": resB["blank_sd_A"]},
-                "range_mgL": [1.0, 25.0],
-                "weighting_scheme": weighting_scheme,
-                "use_replicate_means": resA["used_replicate_means"] and resB["used_replicate_means"],
-                "expected_reps_per_level": expected_reps,
-                "notes": "A = log10(mean(BG)/mean(Sample)); robust mean via MAD; replicate-aware; supports LOC-based concentration inference and variance-weighted regression."
-            }
-            st.markdown("### Download model JSON")
-            st.download_button(
-                "Download fe_model.json",
-                data=json.dumps(model, indent=2),
-                file_name="fe_model.json",
-                mime="application/json",
-            )
-
-# ---------- Unknown Prediction ----------
-with tabs[1]:
-    st.subheader("Predict concentrations for unknown samples")
-    st.write("Upload a **model JSON** and one or two run files. If you upload both Fe²⁺ and Total-Fe runs, the app will compute Fe³⁺ by difference.")
-    model_file = st.file_uploader("Model JSON", type=["json"], key="model_upload")
-    run_files = st.file_uploader("Unknown run JSON(s)", type=["json"], accept_multiple_files=True, key="unknown_runs")
-    if model_file and run_files:
-        try:
-            model = json.loads(model_file.getvalue().decode("utf-8"))
-        except Exception:
-            model = json.loads(model_file.getvalue())
-        led_m = model.get("led", "SC_Green")
-        A_vals = {}
-        details = {}
-        for f in run_files:
-            A, diag, _ = compute_absorbance_from_json_bytes(f.getvalue(), led_key=led_m)
-            details[f.name] = {"A": A, **diag}
-            guess = "Fe2"
-            nm = f.name.lower()
-            if "total" in nm or "tfe" in nm or "fe3" in nm:
-                guess = "TotalFe"
-            A_vals[guess] = A
-        st.markdown("### Run details")
-        st.json(details, expanded=False)
-        out = {}
-        if "Fe2" in A_vals:
-            m = model["slope"]["Fe2"]; b = model["intercept"]["Fe2"]
-            out["Fe2_mgL"] = predict_conc(A_vals["Fe2"], m, b)
-        if "TotalFe" in A_vals:
-            m = model["slope"]["TotalFe"]; b = model["intercept"]["TotalFe"]
-            out["TotalFe_mgL"] = predict_conc(A_vals["TotalFe"], m, b)
-        if "Fe2_mgL" in out and "TotalFe_mgL" in out:
-            out["Fe3_mgL"] = out["TotalFe_mgL"] - out["Fe2_mgL"]
-        st.markdown("### Results")
-        st.json(out, expanded=False)
-
-# ---------- DOE Plan ----------
-with tabs[2]:
-    st.subheader("Generate a randomized DOE plan")
-    st.write("Choose levels (mg/L) and replicates; download a CSV plan with randomized order for Fe²⁺ and Total-Fe.")
-    default_levels = [0, 1, 2, 5, 10, 15, 20, 25]
-    levels_str = st.text_input("Levels (comma-separated mg/L)", ",".join(map(str, default_levels)))
-    reps = st.number_input("Replicates per level", min_value=1, max_value=5, value=2, step=1)
-    if st.button("Build plan"):
-        try:
-            levels = [float(x.strip()) for x in levels_str.split(",") if x.strip() != ""]
-        except Exception:
-            st.error("Could not parse levels. Using defaults.")
-            levels = default_levels
-        rows = []
-        for ch in ["Fe2", "TotalFe"]:
-            pts = []
-            for _ in range(int(reps)):
-                pts.extend(levels)
-            import random
-            random.shuffle(pts)
-            for c in pts:
-                rows.append({
-                    "order": len(rows) + 1,
-                    "channel": ch,
-                    "target_mgL": c,
-                    "json_path": "",
-                    "notes": ""
+# Pre-seed linearity sheets with template rows
+def ensure_linearity_templates():
+    # L1: 12 concentrations × 3 reps
+    name = "4A_Linearity_Phase1"
+    if st.session_state.sheets[name].empty:
+        concentrations = [0,1,2.5,5,7.5,10,12.5,15,17.5,20,22.5,25]
+        data = []
+        tid = 1
+        for c in concentrations:
+            for r in range(1,4):
+                data.append({
+                    "Test #": f"L1-{tid:03d}",
+                    "Shield Test #": "",
+                    "Date": "",
+                    "Target Conc (mg/L)": c,
+                    "LOC Dosing (µL)": "",
+                    "Replicate": r,
+                    "Absorbance": "",
+                    "BG Mean": "",
+                    "Sample Mean": "",
+                    "Temp (°C)": "",
+                    "Status": "PENDING",
+                    "Notes": ""
                 })
-        df = pd.DataFrame(rows)
-        st.dataframe(df)
-        st.download_button("Download DOE CSV", data=df.to_csv(index=False), file_name="doe_plan.csv", mime="text/csv")
+                tid+=1
+        st.session_state.sheets[name] = pd.DataFrame(data)
+    # L2: 8 concentrations × 5 reps
+    name2 = "4A_Linearity_Phase2"
+    if st.session_state.sheets[name2].empty:
+        concentrations = [0,2.5,5,10,15,20,22.5,25]
+        data = []
+        tid = 1
+        for c in concentrations:
+            for r in range(1,6):
+                data.append({
+                    "Test #": f"L2-{tid:03d}",
+                    "Shield Test #": "",
+                    "Date": "",
+                    "Target Conc (mg/L)": c,
+                    "LOC Dosing (µL)": "",
+                    "Replicate": r,
+                    "Absorbance": "",
+                    "BG Mean": "",
+                    "Sample Mean": "",
+                    "Temp (°C)": "",
+                    "Status": "PENDING",
+                    "Notes": ""
+                })
+                tid+=1
+        st.session_state.sheets[name2] = pd.DataFrame(data)
 
-# ---------- JSON Explorer ----------
+ensure_linearity_templates()
+
+# -----------------------------
+# Header
+# -----------------------------
+st.title("🧪 Fe²⁺/Fe³⁺ Method Validation — Streamlit")
+st.caption("Complete validation workspace: LOC configuration, JSON import, auto-concentration, linked validation sheets, and dashboard.")
+
+tabs = st.tabs(["Setup","Import & Process JSON","Validation Sheets","Control Panel","Raw Import Log","Project"])
+
+# -----------------------------
+# Setup
+# -----------------------------
+with tabs[0]:
+    st.subheader("⚙️ LOC Configuration & Volumes")
+    col1, col2 = st.columns((2,1))
+    with col1:
+        st.markdown("**LOC mapping (mark exactly one standard and set its stock concentration)**")
+        edited = st.data_editor(
+            st.session_state.loc_config,
+            column_config={
+                "Is Standard?": st.column_config.CheckboxColumn("Is Standard?"),
+                "Stock Conc (mg/L)": st.column_config.NumberColumn(format="%.6f"),
+            },
+            use_container_width=True,
+            num_rows="fixed",
+            height=420,
+        )
+        st.session_state.loc_config = edited
+    with col2:
+        st.markdown("**Volumes & channel**")
+        vc = st.session_state.vol_config
+        vc["Base Sample Volume (mL)"] = st.number_input("Base Sample Volume (mL)", 1.0, 200.0, float(vc["Base Sample Volume (mL)"]), 0.1)
+        vc["Extra Constant Volume (mL)"] = st.number_input("Extra Constant Volume (mL)", 0.0, 50.0, float(vc["Extra Constant Volume (mL)"]), 0.1)
+        vc["Include LOC Volumes?"] = st.toggle("Include LOC Volumes?", value=bool(vc["Include LOC Volumes?"]))
+        vc["LED Channel"] = st.text_input("LED Channel key", value=vc["LED Channel"])
+        st.session_state.vol_config = vc
+
+    st.divider()
+    st.markdown("**Concentration calculation preview (M₁V₁ = M₂V₂)**")
+    # example preview using first standard LOC with 100 µL spike & sum LOC 0.8 mL
+    std_df = st.session_state.loc_config[st.session_state.loc_config["Is Standard?"]==True]
+    if len(std_df)==1 and pd.notna(std_df.iloc[0]["Stock Conc (mg/L)"]):
+        cstock = float(std_df.iloc[0]["Stock Conc (mg/L)"])
+        Vsp = 0.1 # mL
+        sum_loc = 0.8 if st.session_state.vol_config["Include LOC Volumes?"] else 0.0
+        Vtot = st.session_state.vol_config["Base Sample Volume (mL)"] + st.session_state.vol_config["Extra Constant Volume (mL)"] + sum_loc
+        cfinal = cstock * (Vsp / Vtot)
+        st.info(f"Example: Stock={cstock:g} mg/L, Spike=0.1 mL, Total={Vtot:g} mL → **{cfinal:.3f} mg/L**")
+    else:
+        st.warning("Mark one standard LOC and enter its stock concentration to preview.")
+
+# -----------------------------
+# Import & Process
+# -----------------------------
+def compute_conc_from_loc(loc_doses):
+    # Find standard
+    std_rows = st.session_state.loc_config[st.session_state.loc_config["Is Standard?"]==True]
+    if len(std_rows)!=1 or pd.isna(std_rows.iloc[0]["Stock Conc (mg/L)"]):
+        return 0.0
+    std_loc = std_rows.iloc[0]["LOC"]
+    stock = float(std_rows.iloc[0]["Stock Conc (mg/L)"])
+    spike_uL = float(loc_doses.get(std_loc, 0.0))
+    if spike_uL<=0:
+        return 0.0
+    vc = st.session_state.vol_config
+    Vtot = vc["Base Sample Volume (mL)"] + vc["Extra Constant Volume (mL)"]
+    if vc["Include LOC Volumes?"]:
+        Vtot += sum(loc_doses.values())/1000.0
+    Vsp = spike_uL/1000.0
+    return float(stock * (Vsp / Vtot))
+
+def parse_device_json(file_bytes, fname):
+    try:
+        data = json.loads(file_bytes.decode("utf-8"))
+    except Exception as e:
+        return {"error": f"Invalid JSON: {e}"}
+
+    scans = find_scans(data) or []
+    bg = None; smp = None
+    for sc in scans:
+        stype = get_scan_type(sc)
+        if stype=="background" and bg is None:
+            bg = sc
+        elif stype=="sample":
+            smp = sc  # keep last sample
+
+    channel = st.session_state.vol_config["LED Channel"]
+    bg_vals = get_channel_array(bg or {}, channel)
+    smp_vals = get_channel_array(smp or {}, channel)
+    A, bgm, sm = compute_absorbance(bg_vals, smp_vals)
+
+    doses = extract_loc_doses(smp or {})
+    conc = compute_conc_from_loc(doses)
+
+    # temperature
+    temp = None
+    if isinstance(smp, dict) and "bb_temp" in smp:
+        try: temp=float(smp["bb_temp"])
+        except: pass
+    elif isinstance(data, dict):
+        payload = data.get("payload", {})
+        try: temp=float(payload.get("bb_temp", None))
+        except: pass
+
+    # shield test number
+    stn = ""
+    payload = data.get("payload", {})
+    for key in ("exp_number","test_number","testNumber","shield_test_number"):
+        if key in payload:
+            stn = str(payload[key]); break
+    if not stn:
+        for key in ("exp_number","test_number","testNumber","shield_test_number"):
+            if key in data:
+                stn = str(data[key]); break
+
+    return {
+        "shield": stn,
+        "absorbance": A,
+        "bg_mean": bgm,
+        "sample_mean": sm,
+        "temp": temp,
+        "loc_doses": doses,
+        "calc_conc": conc,
+        "channel": channel,
+    }
+
+def append_raw_log(info, filename, status="INSERTED", target_sheet="", row_inserted=""):
+    log = st.session_state.raw_log
+    newrow = {
+        "Import Time": dt.datetime.now().isoformat(timespec="seconds"),
+        "Shield Test #": info.get("shield",""),
+        "File Name": filename,
+        "Calculated Conc (mg/L)": info.get("calc_conc",0.0),
+        "LOC Doses (µL)": ", ".join(f"{k}:{int(v)}" for k,v in info.get("loc_doses",{}).items()) or "None",
+        "Absorbance": info.get("absorbance", None),
+        "BG Mean": info.get("bg_mean", None),
+        "Sample Mean": info.get("sample_mean", None),
+        "Temperature (°C)": info.get("temp", None),
+        "LED Channel": info.get("channel",""),
+        "Import Status": status,
+        "Target Sheet": target_sheet,
+        "Row Inserted": row_inserted,
+        "Notes": "",
+    }
+    st.session_state.raw_log = pd.concat([log, pd.DataFrame([newrow])], ignore_index=True)
+
+def auto_insert(info):
+    conc = info.get("calc_conc", 0.0)
+    target = "4A_Linearity_Phase1" if conc <= 25 else "7_Sample_Matrix"
+    df = st.session_state.sheets[target]
+    if df.empty:
+        return target, ""
+    # find row where Target Conc matches and Absorbance empty
+    idx = None
+    if "Target Conc (mg/L)" in df.columns:
+        with np.errstate(invalid='ignore'):
+            tc = pd.to_numeric(df["Target Conc (mg/L)"], errors="coerce")
+        candidates = df.index[tc == float(np.round(conc,6))].tolist()
+        for i in candidates:
+            if pd.isna(df.loc[i,"Absorbance"]) or df.loc[i,"Absorbance"]=="":
+                idx = i; break
+    if idx is None:
+        # append at end with minimal columns
+        newrow = {c:"" for c in df.columns}
+        if "Target Conc (mg/L)" in newrow:
+            newrow["Target Conc (mg/L)"]=conc
+        df = pd.concat([df, pd.DataFrame([newrow])], ignore_index=True)
+        idx = len(df)-1
+    # write values
+    if "Shield Test #"] in df.columns:
+        df.loc[idx,"Shield Test #"] = info.get("shield","")
+    if "Date" in df.columns:
+        df.loc[idx,"Date"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    if "LOC Dosing (µL)" in df.columns:
+        df.loc[idx,"LOC Dosing (µL)"] = ", ".join(f"{k}:{int(v)}" for k,v in info.get("loc_doses",{}).items()) or ""
+    if "Absorbance" in df.columns:
+        df.loc[idx,"Absorbance"] = info.get("absorbance","")
+    if "BG Mean" in df.columns:
+        df.loc[idx,"BG Mean"] = info.get("bg_mean","")
+    if "Sample Mean" in df.columns:
+        df.loc[idx,"Sample Mean"] = info.get("sample_mean","")
+    if "Temp (°C)" in df.columns:
+        df.loc[idx,"Temp (°C)"] = info.get("temp","")
+    if "Status" in df.columns:
+        df.loc[idx,"Status"] = "COMPLETE"
+    st.session_state.sheets[target] = df
+    return target, str(idx+2)  # approximated row
+
+with tabs[1]:
+    st.subheader("📥 Import & Process JSON")
+    up = st.file_uploader("Upload one or more device JSON files", type=["json"], accept_multiple_files=True)
+    if up:
+        for f in up:
+            info = parse_device_json(f.read(), f.name)
+            if "error" in info:
+                st.error(f"{f.name}: {info['error']}")
+                append_raw_log({"channel": st.session_state.vol_config["LED Channel"]}, f.name, status="FAILED")
+                continue
+            tgt, row = auto_insert(info)
+            append_raw_log(info, f.name, status="INSERTED", target_sheet=tgt, row_inserted=row)
+        st.success("Import complete. See Raw Import Log and Validation Sheets.")
+
+# -----------------------------
+# Validation Sheets
+# -----------------------------
+with tabs[2]:
+    st.subheader("📊 Validation Sheets")
+    choose = st.selectbox("Select sheet", DEFAULT_SHEETS, index=0)
+    df = st.session_state.sheets.get(choose, pd.DataFrame())
+    edited = st.data_editor(df, use_container_width=True, height=420, num_rows="dynamic")
+    st.session_state.sheets[choose] = edited
+    colA, colB = st.columns(2)
+    with colA:
+        st.download_button("Download sheet as CSV", data=edited.to_csv(index=False), file_name=f"{choose}.csv", mime="text/csv")
+    with colB:
+        # simple trend plot if columns exist
+        if "Target Conc (mg/L)" in edited.columns and "Absorbance" in edited.columns:
+            try:
+                x = pd.to_numeric(edited["Target Conc (mg/L)"], errors="coerce")
+                y = pd.to_numeric(edited["Absorbance"], errors="coerce")
+                mask = x.notna() & y.notna()
+                fig, ax = plt.subplots(figsize=(5,3.2))
+                ax.scatter(x[mask], y[mask])
+                ax.set_xlabel("Conc (mg/L)"); ax.set_ylabel("Absorbance (A)"); ax.set_title("Calibration points (sheet view)")
+                st.pyplot(fig)
+            except Exception as e:
+                st.caption(f"Plot unavailable: {e}")
+
+# -----------------------------
+# Control Panel
+# -----------------------------
+def progress_summary():
+    rows = []
+    mapping = {
+        "4A_Linearity_Phase1":36,
+        "4A_Linearity_Phase2":40,
+        "4B_Interference":108,
+        "5A_Repeatability":30,
+        "5A_Intermediate_Precision":45,
+        "5B_Accuracy":36,
+        "5C_LOD_LOQ":10,
+        "5D_Stability":48,
+        "6_Robustness":24,
+        "7_Sample_Matrix":36,
+    }
+    for name, total in mapping.items():
+        df = st.session_state.sheets.get(name, pd.DataFrame())
+        complete = 0
+        if not df.empty and "Status" in df.columns:
+            complete = int((df["Status"]=="COMPLETE").sum())
+        rows.append([name, total, complete, total-complete, (complete/total if total>0 else 0.0)])
+    res = pd.DataFrame(rows, columns=["Validation Step","Total Tests","Completed","Pending","Progress %"])
+    return res
+
 with tabs[3]:
-    st.subheader("Inspect a single JSON")
-    f = st.file_uploader("Upload a run JSON", type=["json"], key="explore_json")
-    led_sel = st.selectbox("LED for this view", ["SC_Green","SC_Blue2","SC_Orange","SC_Red"], index=0, key="expl_led")
-    if f:
-        try:
-            A, diag, obj = compute_absorbance_from_json_bytes(f.getvalue(), led_key=led_sel)
-            st.success(f"Absorbance (A) at {led_sel}: {A:.6f}")
-            st.json(diag, expanded=False)
-            locs = get_loc_doses_from_sample(obj)
-            if locs:
-                st.write("Detected LOC doses (µL):", locs)
-            st.table({k: [v] for k, v in diag.items()})
-        except Exception as e:
-            st.error(str(e))
+    st.subheader("🎯 Control Panel & Progress")
+    cp = progress_summary()
+    st.dataframe(cp, use_container_width=True)
+    st.metric("Files Imported", len(st.session_state.raw_log))
+    st.metric("Overall Progress", f"{100*cp['Progress %'].mean():.1f}%")
 
-# ---------- About ----------
+# -----------------------------
+# Raw Import Log
+# -----------------------------
 with tabs[4]:
-    st.markdown("""
-**Fe Phenanthroline Calibration & Analysis**  
-- Parses device JSON with *Background* and *Sample* in the **same file** (even if `scans` is nested under `payload`).  
-- Uses **SC_Green** (or selectable) channel; averages 10 readings with MAD outlier filtering.  
-- Absorbance: `A = log10(mean(BG) / mean(Sample))`.  
-- Can **infer calibration concentrations from LOC doses** via \(M_1V_1=M_2V_2\) using a **LOC Profile** (persistent mapping of roles/stock) or manual entry.  
-- Supports **replicate-aware** summaries, **variance-weighted (1/SD²)** or **1/max(C,1)** regression, and exports **PNG/PDF** calibration plots.  
-- If **no standard spike** is detected or selected, the run is treated as a **0 mg/L blank** automatically.
-""")
-    st.caption("Tip: Include ≥4 blanks spread across the run to stabilize LoD/LoQ.")
+    st.subheader("📋 Raw Import Log")
+    st.dataframe(st.session_state.raw_log, use_container_width=True, height=420)
+    st.download_button("Download log CSV", data=st.session_state.raw_log.to_csv(index=False), file_name="raw_import_log.csv", mime="text/csv")
+
+# -----------------------------
+# Project Save/Load
+# -----------------------------
+def export_project_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        # config
+        z.writestr("loc_config.csv", st.session_state.loc_config.to_csv(index=False))
+        z.writestr("vol_config.json", json.dumps(st.session_state.vol_config, indent=2))
+        # sheets
+        for name, df in st.session_state.sheets.items():
+            z.writestr(f"sheets/{name}.csv", df.to_csv(index=False))
+        # log
+        z.writestr("raw_import_log.csv", st.session_state.raw_log.to_csv(index=False))
+    buf.seek(0)
+    return buf.getvalue()
+
+def import_project_zip(uploaded):
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(uploaded.read()))
+        # configs
+        if "loc_config.csv" in zf.namelist():
+            st.session_state.loc_config = pd.read_csv(zf.open("loc_config.csv"))
+        if "vol_config.json" in zf.namelist():
+            st.session_state.vol_config = json.loads(zf.read("vol_config.json"))
+        # sheets
+        for name in DEFAULT_SHEETS:
+            p = f"sheets/{name}.csv"
+            if p in zf.namelist():
+                st.session_state.sheets[name] = pd.read_csv(zf.open(p))
+        # log
+        if "raw_import_log.csv" in zf.namelist():
+            st.session_state.raw_log = pd.read_csv(zf.open("raw_import_log.csv"))
+        st.success("Project restored.")
+    except Exception as e:
+        st.error(f"Failed to import project: {e}")
+
+with tabs[5]:
+    st.subheader("📦 Project Export / Import")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button("Download Project ZIP", data=export_project_zip(), file_name="fe_validation_project.zip", mime="application/zip")
+    with col2:
+        upz = st.file_uploader("Import Project ZIP", type=["zip"], key="proj_zip")
+        if upz:
+            import_project_zip(upz)
+
+st.markdown("---")
+st.caption("Tip: This app expects device JSON files that contain both Background and Sample scans and an LED channel (default: SC_Green). It uses the last Sample scan for dosing and absorbance calculations.")
