@@ -1494,8 +1494,8 @@ def show_dashboard():
 
 if __name__ == "__main__":
     main()
-            nbinsx=10,
-            marker_color='purple'
+        nbinsx=10,
+        marker_color='purple'
         ))
         fig_hist.update_layout(
             title="Residuals Distribution",
