@@ -1124,6 +1124,514 @@ def show_design_tab(step_id, step_config):
             st.rerun()
 
 
+# ============================================================================
+# MISSING FUNCTIONS - Add these after show_design_tab() function
+# ============================================================================
+
+def show_collect_tab(step_id, step_config):
+    """Data collection tab"""
+    st.subheader("📥 Data Collection")
+    
+    if step_id not in st.session_state.designs:
+        st.warning("⚠️ Please design experiment first")
+        return
+    
+    design = st.session_state.designs[step_id]
+    results = st.session_state.results[step_id]
+    
+    expected = len(design.spike_levels) * design.num_replicates if design.spike_levels else step_config.expected_tests
+    collected = len(results)
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Expected", expected)
+    with col2:
+        st.metric("Collected", collected)
+    with col3:
+        st.metric("Progress", f"{(collected/expected*100) if expected > 0 else 0:.0f}%")
+    
+    st.progress(min(collected / expected, 1.0) if expected > 0 else 0)
+    
+    st.markdown("---")
+    
+    uploaded_files = st.file_uploader("Upload JSON files", type=['json'], accept_multiple_files=True)
+    
+    if uploaded_files:
+        new_results = []
+        
+        for idx, file in enumerate(uploaded_files):
+            with st.expander(f"📄 {file.name}", expanded=(idx==0)):
+                try:
+                    content = file.read().decode('utf-8')
+                    extracted = extract_json_data(content)
+                    
+                    if extracted:
+                        concentration = calculate_concentration(extracted['loc_doses'], st.session_state.loc_config)
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Concentration", f"{concentration:.3f} mg/L")
+                        with col2:
+                            st.metric("Absorbance", f"{extracted['absorbance']:.4f}" if extracted['absorbance'] else "N/A")
+                        
+                        # Basic mapping
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            level = st.number_input("Level", 1, len(design.spike_levels), 1, key=f"lev_{idx}")
+                        with col2:
+                            rep = st.number_input("Replicate", 1, design.num_replicates, 1, key=f"rep_{idx}")
+                        
+                        # Step-specific metadata
+                        metadata = {}
+                        
+                        if step_id == 'interference':
+                            interferent = st.selectbox(
+                                "Interferent",
+                                ['None'] + (design.custom_params.get('interferents', []) if design.custom_params else []),
+                                key=f"int_{idx}"
+                            )
+                            metadata = {'interferent': interferent}
+                        
+                        elif step_id == 'intermediate':
+                            test_day = st.selectbox("Test Day", list(range(1, design.custom_params.get('num_days', 3) + 1)), key=f"day_{idx}")
+                            metadata = {'test_day': test_day}
+                        
+                        elif step_id == 'stability':
+                            time_point = st.selectbox("Time Point", design.custom_params.get('time_points', ['T0']), key=f"time_{idx}")
+                            storage = st.selectbox("Storage", design.custom_params.get('storage_conditions', ['Room Temp']), key=f"stor_{idx}")
+                            metadata = {'time_point': time_point, 'storage': storage}
+                        
+                        elif step_id == 'robustness':
+                            parameter = st.selectbox("Parameter", design.custom_params.get('parameters', []), key=f"param_{idx}")
+                            variation = st.selectbox("Variation", ['Normal', '+Δ', '-Δ'], key=f"var_{idx}")
+                            metadata = {'parameter': parameter, 'variation': variation}
+                        
+                        elif step_id == 'matrix':
+                            matrix = st.selectbox("Matrix", design.custom_params.get('matrices', ['DI Water']), key=f"mat_{idx}")
+                            metadata = {'matrix': matrix}
+                        
+                        result = TestResult(
+                            step_id=step_id,
+                            test_number=collected + len(new_results) + 1,
+                            shield_test_number=extracted['shield_test_number'],
+                            timestamp=extracted['timestamp'],
+                            concentration=concentration,
+                            absorbance=extracted['absorbance'] or 0.0,
+                            bg_mean=extracted['bg_mean'] or 0.0,
+                            sample_mean=extracted['sample_mean'] or 0.0,
+                            temperature=extracted['temperature'] or 0.0,
+                            loc_doses=extracted['loc_doses'],
+                            level_number=level,
+                            replicate_number=rep,
+                            metadata=metadata if metadata else None
+                        )
+                        
+                        new_results.append(result)
+                        st.success("✅ Ready to import")
+                    
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
+        
+        if new_results:
+            st.markdown("---")
+            if st.button(f"📥 Import {len(new_results)} test(s)", type="primary"):
+                st.session_state.results[step_id].extend(new_results)
+                st.session_state.validation_steps[step_id].status = 'collecting'
+                st.success(f"✅ Imported {len(new_results)} tests!")
+                st.rerun()
+    
+    if results:
+        st.markdown("---")
+        st.subheader("📊 Collected Data")
+        
+        df = pd.DataFrame([{
+            'Test': r.test_number,
+            'Shield #': r.shield_test_number,
+            'Level': r.level_number,
+            'Rep': r.replicate_number,
+            'Conc (mg/L)': f"{r.concentration:.3f}",
+            'Abs': f"{r.absorbance:.4f}"
+        } for r in results])
+        
+        st.dataframe(safe_dataframe_display(df), width='stretch')
+        
+        if st.button("🗑️ Delete Last Import"):
+            if results:
+                st.session_state.results[step_id].pop()
+                st.success("Deleted last import")
+                st.rerun()
+
+def show_analyze_tab(step_id, step_config):
+    """Analysis tab"""
+    st.subheader("📊 Statistical Analysis")
+    
+    results = st.session_state.results[step_id]
+    
+    if not results:
+        st.warning("⚠️ No data to analyze")
+        return
+    
+    if step_id not in st.session_state.designs:
+        st.error("❌ No design found")
+        return
+    
+    design = st.session_state.designs[step_id]
+    
+    if st.button("🔬 Run Analysis", type="primary"):
+        with st.spinner("Analyzing..."):
+            df = pd.DataFrame([asdict(r) for r in results])
+            
+            try:
+                # Route to appropriate analysis function
+                if step_id == 'linearity':
+                    analysis = analyze_linearity(df, design, step_config)
+                elif step_id == 'interference':
+                    analysis = analyze_interference(df, design, step_config)
+                elif step_id == 'repeatability':
+                    analysis = analyze_repeatability(df, design, step_config)
+                elif step_id == 'intermediate':
+                    analysis = analyze_intermediate(df, design, step_config)
+                elif step_id == 'accuracy':
+                    analysis = analyze_accuracy(df, design, step_config)
+                elif step_id == 'lod_loq':
+                    analysis = analyze_lod_loq(df, design, step_config)
+                elif step_id == 'stability':
+                    analysis = analyze_stability(df, design, step_config)
+                elif step_id == 'robustness':
+                    analysis = analyze_robustness(df, design, step_config)
+                elif step_id == 'matrix':
+                    analysis = analyze_matrix(df, design, step_config)
+                elif step_id == 'range':
+                    analysis = analyze_range(df, design, step_config)
+                else:
+                    analysis = {'error': 'Analysis not implemented'}
+                
+                if 'error' in analysis:
+                    st.error(f"❌ {analysis['error']}")
+                else:
+                    st.session_state.analyses[step_id] = analysis
+                    st.session_state.validation_steps[step_id].status = 'analyzed'
+                    st.success("✅ Analysis complete!")
+                    st.rerun()
+            
+            except Exception as e:
+                st.error(f"❌ Analysis failed: {str(e)}")
+    
+    if step_id in st.session_state.analyses:
+        st.success("✅ Analysis completed! View results in the Results tab")
+
+def show_results_tab(step_id, step_config):
+    """Results visualization tab"""
+    st.subheader("📈 Results")
+    
+    if step_id not in st.session_state.analyses:
+        st.warning("⚠️ Run analysis first")
+        return
+    
+    analysis = st.session_state.analyses[step_id]
+    
+    if 'error' in analysis:
+        st.error(f"❌ {analysis['error']}")
+        return
+    
+    # Route to appropriate results display
+    if step_id == 'linearity':
+        show_linearity_results(analysis, step_config)
+    elif step_id == 'interference':
+        show_interference_results(analysis, step_config)
+    elif step_id == 'repeatability':
+        show_repeatability_results(analysis, step_config)
+    elif step_id == 'intermediate':
+        show_intermediate_results(analysis, step_config)
+    elif step_id == 'accuracy':
+        show_accuracy_results(analysis, step_config)
+    elif step_id == 'lod_loq':
+        show_lod_loq_results(analysis, step_config)
+    elif step_id == 'stability':
+        show_stability_results(analysis, step_config)
+    elif step_id == 'robustness':
+        show_robustness_results(analysis, step_config)
+    elif step_id == 'matrix':
+        show_matrix_results(analysis, step_config)
+    elif step_id == 'range':
+        show_range_results(analysis, step_config)
+
+# ============================================================================
+# RESULTS DISPLAY FUNCTIONS (ADD MISSING ONES)
+# ============================================================================
+
+def show_linearity_results(analysis, config):
+    """Display linearity results"""
+    if analysis['passes']:
+        st.markdown(f"""
+        <div class="success-box">
+        ✅ <strong>LINEARITY TEST PASSED</strong><br>
+        R² = {analysis['r_squared']:.4f} (Criteria: ≥ {config.acceptance_criteria['r_squared']})
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div class="error-box">
+        ❌ <strong>LINEARITY TEST FAILED</strong><br>
+        R² = {analysis['r_squared']:.4f} (Criteria: ≥ {config.acceptance_criteria['r_squared']})
+        </div>
+        """, unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("R²", f"{analysis['r_squared']:.4f}")
+    with col2:
+        st.metric("Slope", f"{analysis['slope']:.6f}")
+    with col3:
+        st.metric("Intercept", f"{analysis['intercept']:.6f}")
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=analysis['x'],
+        y=analysis['y'],
+        mode='markers',
+        name='Data',
+        marker=dict(size=10, color='#4A90E2')
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=analysis['x'],
+        y=analysis['y_pred'],
+        mode='lines',
+        name='Regression',
+        line=dict(color='red', width=2)
+    ))
+    
+    fig.update_layout(
+        title=f"Calibration Curve: y = {analysis['slope']:.6f}x + {analysis['intercept']:.6f}",
+        xaxis_title="Concentration (mg/L)",
+        yaxis_title="Absorbance",
+        height=500
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Residuals
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        fig_res = go.Figure()
+        fig_res.add_trace(go.Scatter(
+            x=analysis['x'],
+            y=analysis['residuals'],
+            mode='markers',
+            marker=dict(size=8, color='purple')
+        ))
+        fig_res.add_hline(y=0, line_dash="dash", line_color="red")
+        fig_res.update_layout(
+            title="Residuals Plot",
+            xaxis_title="Concentration (mg/L)",
+            yaxis_title="Residuals",
+            height=400
+        )
+        st.plotly_chart(fig_res, use_container_width=True)
+    
+    with col2:
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Histogram(
+            x=analysis['residuals'],
+            nbinsx=10,
+            marker_color='purple'
+        ))
+        fig_hist.update_layout(
+            title="Residuals Distribution",
+            xaxis_title="Residuals",
+            yaxis_title="Frequency",
+            height=400
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+def show_interference_results(analysis, config):
+    """Display interference results"""
+    st.info(f"**Control Mean:** {analysis['control_mean']:.3f} mg/L")
+    
+    # Summary table
+    data = []
+    for interferent, res in analysis['by_interferent'].items():
+        data.append({
+            'Interferent': interferent,
+            'Mean (mg/L)': f"{res['mean']:.3f}",
+            'Recovery (%)': f"{res['recovery']:.1f}",
+            'RSD (%)': f"{res['rsd']:.2f}",
+            'Status': '✅ Pass' if res['passes'] else '❌ Fail'
+        })
+    
+    df = pd.DataFrame(data)
+    st.dataframe(safe_dataframe_display(df), width='stretch')
+    
+    # Recovery chart
+    fig = go.Figure()
+    
+    interferents = list(analysis['by_interferent'].keys())
+    recoveries = [analysis['by_interferent'][i]['recovery'] for i in interferents]
+    colors = ['green' if analysis['by_interferent'][i]['passes'] else 'red' for i in interferents]
+    
+    fig.add_trace(go.Bar(
+        x=interferents,
+        y=recoveries,
+        marker_color=colors,
+        text=[f"{r:.1f}%" for r in recoveries],
+        textposition='outside'
+    ))
+    
+    fig.add_hrect(
+        y0=config.acceptance_criteria['recovery_range'][0],
+        y1=config.acceptance_criteria['recovery_range'][1],
+        fillcolor="green",
+        opacity=0.1,
+        line_width=0
+    ))
+    
+    fig.update_layout(
+        title="Recovery by Interferent",
+        xaxis_title="Interferent",
+        yaxis_title="Recovery (%)",
+        height=500
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    if analysis['passes']:
+        st.success("✅ All interferents within acceptable range")
+    else:
+        st.error("❌ Some interferents outside acceptable range")
+
+def show_repeatability_results(analysis, config):
+    """Display repeatability results"""
+    if analysis['passes']:
+        st.success("✅ REPEATABILITY TEST PASSED: All levels meet RSD criteria")
+    else:
+        st.error("❌ REPEATABILITY TEST FAILED: Some levels exceed RSD")
+    
+    data = []
+    for level, res in analysis['by_level'].items():
+        data.append({
+            'Level': level,
+            'Mean (mg/L)': f"{res['mean']:.3f}",
+            'Std Dev': f"{res['std']:.3f}",
+            'RSD (%)': f"{res['rsd']:.2f}",
+            'n': res['n'],
+            'Status': '✅' if res['passes'] else '❌'
+        })
+    
+    df = pd.DataFrame(data)
+    st.dataframe(safe_dataframe_display(df), width='stretch')
+    
+    # Box plot
+    fig = go.Figure()
+    
+    for level, res in analysis['by_level'].items():
+        fig.add_trace(go.Box(
+            y=res['data'],
+            name=f"Level {level}",
+            boxmean='sd'
+        ))
+    
+    fig.update_layout(
+        title="Distribution by Level",
+        xaxis_title="Level",
+        yaxis_title="Concentration (mg/L)",
+        height=500
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # RSD chart
+    levels = list(analysis['by_level'].keys())
+    rsds = [analysis['by_level'][l]['rsd'] for l in levels]
+    colors = ['green' if analysis['by_level'][l]['passes'] else 'red' for l in levels]
+    
+    fig_rsd = go.Figure()
+    fig_rsd.add_trace(go.Bar(
+        x=[f"Level {l}" for l in levels],
+        y=rsds,
+        marker_color=colors,
+        text=[f"{r:.2f}%" for r in rsds],
+        textposition='outside'
+    ))
+    
+    fig_rsd.add_hline(
+        y=config.acceptance_criteria['rsd'],
+        line_dash="dash",
+        line_color="red",
+        annotation_text=f"Criteria: {config.acceptance_criteria['rsd']}%"
+    )
+    
+    fig_rsd.update_layout(
+        title="RSD Comparison",
+        xaxis_title="Level",
+        yaxis_title="RSD (%)",
+        height=400
+    )
+    
+    st.plotly_chart(fig_rsd, use_container_width=True)
+
+def show_intermediate_results(analysis, config):
+    """Display intermediate precision results"""
+    st.info("**Note:** This analysis assesses precision across multiple days/analysts")
+    show_repeatability_results(analysis, config)
+
+def show_accuracy_results(analysis, config):
+    """Display accuracy results"""
+    if analysis['passes']:
+        st.success("✅ ACCURACY TEST PASSED: All recoveries acceptable")
+    else:
+        st.error("❌ ACCURACY TEST FAILED: Some recoveries outside range")
+    
+    data = []
+    for level, res in analysis['by_level'].items():
+        data.append({
+            'Level': level,
+            'Spiked (mg/L)': f"{res['spike_conc']:.3f}",
+            'Measured (mg/L)': f"{res['measured']:.3f}",
+            'Recovery (%)': f"{res['recovery']:.1f}",
+            'RSD (%)': f"{res['rsd']:.2f}",
+            'n': res['n'],
+            'Status': '✅' if res['passes'] else '❌'
+        })
+    
+    df = pd.DataFrame(data)
+    st.dataframe(safe_dataframe_display(df), width='stretch')
+    
+    # Recovery chart
+    levels = list(analysis['by_level'].keys())
+    recoveries = [analysis['by_level'][l]['recovery'] for l in levels]
+    colors = ['green' if analysis['by_level'][l]['passes'] else 'red' for l in levels]
+    
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=[f"Level {l}" for l in levels],
+        y=recoveries,
+        marker_color=colors,
+        text=[f"{r:.1f}%" for r in recoveries],
+        textposition='outside'
+    ))
+    
+    fig.add_hrect(
+        y0=config.acceptance_criteria['recovery_range'][0],
+        y1=config.acceptance_criteria['recovery_range'][1],
+        fillcolor="green",
+        opacity=0.1,
+        line_width=0
+    )
+    
+    fig.add_hline(y=100, line_dash="dash", line_color="blue")
+    
+    fig.update_layout(
+        title="Recovery by Spike Level",
+        xaxis_title="Level",
+        yaxis_title="Recovery (%)",
+        height=500
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+
 def show_lod_loq_results(analysis, config):
     """Display LOD/LOQ results"""
     st.subheader("🔍 Detection and Quantification Limits")
