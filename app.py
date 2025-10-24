@@ -1441,6 +1441,9 @@ def show_design_tab(session_id, step_id, step_config):
             )
             
             designs[step_id] = design
+            
+            # Update step status
+            steps = st.session_state[f'validation_steps_{session_id}']
             steps[step_id].status = 'designed'
             
             # Save session
